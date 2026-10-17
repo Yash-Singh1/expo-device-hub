@@ -1,3 +1,4 @@
+import { captureScreenshotFileAsync, ScreenshotDisplay } from "./screenshot-store";
 import { openSseStream } from "./sse-stream";
 import { parseCaptureProxy } from "./capture/upstream";
 import { execFile, execSync } from "child_process";
@@ -2794,21 +2795,26 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         res.end(JSON.stringify({ ok: false, error: "No booted simulator to screenshot" }));
         return;
       }
-      // simctl only writes to a file, so round-trip through a private tmp path
-      // instead of streaming; captures are a few MB at most.
+      const displayValue = new URL(rawUrl, "http://localhost").searchParams.get("display");
+      const display = displayValue === null ? undefined : ScreenshotDisplay.safeParse(Number(displayValue));
+      if (display && !display.success) {
+        res.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Invalid simulator display ID" }));
+        return;
+      }
+      udid = udid.toUpperCase();
+      // HTTP downloads avoid staging and Desktop copies, but share panel election.
       const file = join(tmpdir(), `serve-sim-screenshot-${randomBytes(8).toString("hex")}.png`);
       try {
-        await new Promise<void>((resolve, reject) => {
-          execFile(
-            "xcrun",
-            ["simctl", "io", udid, "screenshot", file],
-            { timeout: 5_000 },
-            (err, _stdout, stderr) => {
-              if (err) reject(Object.assign(err, { stderr: stderr?.toString() }));
-              else resolve();
-            },
-          );
-        });
+        let screenId = display?.data;
+        let readActiveDisplay: (() => Promise<number>) | undefined;
+        if (screenId === undefined) {
+          const session = getDeviceSession(udid, streamSettings);
+          readActiveDisplay = () => session.activeScreenId();
+          screenId = await readActiveDisplay();
+        }
+        const result = await captureScreenshotFileAsync({ udid, file, display: screenId, timeoutMs: 5_000 }, readActiveDisplay);
+        if (result.exitCode !== 0) throw new Error(result.stderr || "simctl screenshot failed");
         const png = await readFile(file);
         const artifact = await saveScreenshotArtifact(png);
         recordScreenshotEvent(udid, artifact);

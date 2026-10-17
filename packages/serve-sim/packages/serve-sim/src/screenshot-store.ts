@@ -59,6 +59,37 @@ async function isEmptyFileAsync(path: string): Promise<boolean> {
   }
 }
 
+export const ScreenshotDisplay = z.number().int().min(1).max(0xffff_ffff);
+
+/** Same panel election and bounded retry for host actions and HTTP downloads. */
+export async function captureScreenshotFileAsync(
+  p: {
+    udid: string;
+    file: string;
+    display: number;
+    timeoutMs?: number;
+  },
+  readActiveDisplay?: () => Promise<number>,
+): Promise<HostActionResult> {
+  let display = p.display;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const shot = await runInvocation({
+      file: "xcrun",
+      args: ["simctl", "io", p.udid, "screenshot", `--display=${display}`, p.file],
+      timeoutMs: p.timeoutMs,
+    });
+    if (shot.exitCode !== 0 || !readActiveDisplay) return shot;
+    const current = await readActiveDisplay();
+    if (current === display) return shot;
+    display = current;
+  }
+  return {
+    stdout: "",
+    stderr: "The active display kept changing. Retry the screenshot once the fold has finished.",
+    exitCode: 1,
+  };
+}
+
 export async function captureScreenshotAsync(
   p: {
     udid: string;
@@ -95,25 +126,12 @@ export async function captureScreenshotAsync(
       exitCode: 1,
     };
   }
-  let display = p.display;
-  let shot: HostActionResult = { stdout: "", stderr: "", exitCode: 1 };
+  let shot: HostActionResult;
   try {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      shot = await runInvocation({
-        file: "xcrun",
-        args: ["simctl", "io", p.udid, "screenshot", `--display=${display}`, staged],
-      });
-      if (shot.exitCode !== 0 || !readActiveDisplay) break;
-      const current = await readActiveDisplay();
-      if (current === display) break;
-      display = current;
-      shot = {
-        stdout: "",
-        stderr:
-          "The active display kept changing. Retry the screenshot once the fold has finished.",
-        exitCode: 1,
-      };
-    }
+    shot = await captureScreenshotFileAsync(
+      { udid: p.udid, file: staged, display: p.display },
+      readActiveDisplay,
+    );
   } catch (error) {
     if (await isEmptyFileAsync(staged)) await rm(staged, { force: true });
     throw error;
