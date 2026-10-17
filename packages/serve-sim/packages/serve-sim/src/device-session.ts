@@ -2926,6 +2926,7 @@ export class DeviceSession {
 // ── Registry ─────────────────────────────────────────────────────────────
 
 const sessions = new Map<string, DeviceSession>();
+const screenshotOwners = new Map<DeviceSession, { count: number; retained: boolean }>();
 const closedSessionStops = new Set<Promise<void>>();
 const closedSessionStopErrors: unknown[] = [];
 let recordingsShuttingDown = false;
@@ -2956,6 +2957,10 @@ export function getDeviceSession(
   initialStreamSettings?: StreamSettings,
 ): DeviceSession {
   let session = sessions.get(udid);
+  if (session) {
+    const owner = screenshotOwners.get(session);
+    if (owner) owner.retained = true;
+  }
   if (!session) {
     const createdSession = new DeviceSession(udid, initialStreamSettings);
     session = createdSession;
@@ -2976,16 +2981,21 @@ export function getDeviceSession(
   return session;
 }
 
-/** A one-shot screenshot borrows a live session or owns a temporary capture. */
+/** Share screenshot startup, releasing capture unless another consumer claims it. */
 export async function withScreenshotDeviceSession<T>(udid: string, settings: StreamSettings | undefined,
   capture: (session: DeviceSession) => Promise<T>): Promise<T> {
   const existing = peekDeviceSession(udid);
-  const session = existing ?? new DeviceSession(udid, settings);
+  const session = existing ?? getDeviceSession(udid, settings);
+  const owner = screenshotOwners.get(session) ?? (!existing ? { count: 0, retained: false } : undefined);
+  if (owner) { owner.count++; screenshotOwners.set(session, owner); }
   try {
     await session.start();
     return await capture(session);
   } finally {
-    if (!existing) session.close();
+    if (owner && --owner.count === 0) {
+      screenshotOwners.delete(session);
+      if (!owner.retained && sessions.get(udid) === session) closeDeviceSession(udid);
+    }
   }
 }
 
