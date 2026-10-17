@@ -50,6 +50,7 @@ import { corsAllowOriginHeaders, frameAncestorsPolicy, isAllowedOrigin } from ".
 import {
   closeDeviceSession,
   getDeviceSession,
+  withScreenshotDeviceSession,
   peekDeviceSession,
   retainDeviceSession,
   withDeviceSessionTask,
@@ -2806,14 +2807,14 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       // HTTP downloads avoid staging and Desktop copies, but share panel election.
       const file = join(tmpdir(), `serve-sim-screenshot-${randomBytes(8).toString("hex")}.png`);
       try {
-        let screenId = display?.data;
-        let readActiveDisplay: (() => Promise<number>) | undefined;
-        if (screenId === undefined) {
-          const session = getDeviceSession(udid, streamSettings);
-          readActiveDisplay = () => session.activeScreenId();
-          screenId = await readActiveDisplay();
-        }
-        const result = await captureScreenshotFileAsync({ udid, file, display: screenId, timeoutMs: 5_000 }, readActiveDisplay);
+        const screenId = display?.data;
+        const capture = (id: number, read?: () => Promise<number>) =>
+          captureScreenshotFileAsync({ udid, file, display: id, timeoutMs: 5_000 }, read);
+        const result = screenId !== undefined ? await capture(screenId)
+          : await withScreenshotDeviceSession(udid, streamSettings, async session => {
+            const read = () => session.activeScreenId();
+            return await capture(await read(), read);
+          });
         if (result.exitCode !== 0) throw new Error(result.stderr || "simctl screenshot failed");
         const png = await readFile(file);
         const artifact = await saveScreenshotArtifact(png);
@@ -2841,7 +2842,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           "Cache-Control": "no-store",
           "Content-Type": "application/json",
         });
-        res.end(JSON.stringify({ ok: false, error: message }));
+        res.end(JSON.stringify({ ok: false, error: "Simulator screenshot failed" }));
       } finally {
         // Best-effort cleanup; the PNG is already in memory by now.
         await unlink(file).catch(() => {});

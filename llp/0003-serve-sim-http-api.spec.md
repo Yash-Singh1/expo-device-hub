@@ -570,4 +570,6 @@ The HTTP `/api/screenshot` download follows the same native active-display
 selection and three-attempt handoff bound as `screenshot.capture`. Its optional
 `display` query selects an explicit panel without starting native capture. It
 keeps the existing PNG response, artifact headers, and temporary-file cleanup,
-without the host action's Desktop copy.
+without the host action's Desktop copy. Default HTTP captures share the same
+one-shot session ownership. Capture errors return a generic message; private
+native-startup and simctl diagnostics stay in host logs.

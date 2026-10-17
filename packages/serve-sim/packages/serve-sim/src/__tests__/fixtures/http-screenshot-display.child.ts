@@ -8,12 +8,13 @@ import type { StreamEncoderSettings } from "../../stream-settings";
 
 let active: number | Error = 1;
 let sequence: Array<number | Error> = [];
+let stops = 0;
 let startupError: Error | undefined;
 const captures: Array<{ udid: string; settings: StreamEncoderSettings }> = [];
 class Capture {
   constructor(udid: string, settings: StreamEncoderSettings) { captures.push({ udid, settings }); }
   async start() { if (startupError) throw startupError; }
-  async stop() {}
+  async stop() { stops++; }
   async subscribeScreenChanges() { return async () => {}; }
   async subscribeDeviceState() { return async () => {}; }
   async screenSize() { return { width: 2007, height: 2853, screenId: 3, orientation: "portrait" }; }
@@ -39,7 +40,7 @@ const middleware = simMiddleware({ basePath: "/preview", streamSettings: setting
 async function shot(extra = "") {
   return (await middleware(new Request(`http://localhost/preview/api/screenshot?device=${UDID.toLowerCase()}${extra}`, { method: "POST", headers: { origin: "https://expo.dev" } })))!;
 }
-afterEach(() => { closeDeviceSession(UDID); active = 1; sequence = []; startupError = undefined; captures.length = 0; });
+afterEach(() => { closeDeviceSession(UDID); active = 1; sequence = []; startupError = undefined; captures.length = 0; stops = 0; });
 afterAll(() => { shims.restore(); temp.restore(); delete process.env.SERVE_SIM_HTTP_SHOTS; });
 
 test("HTTP screenshots select the active cover or inner panel with trusted startup settings", async () => {
@@ -50,12 +51,14 @@ test("HTTP screenshots select the active cover or inner panel with trusted start
     expect(res.headers.get("access-control-allow-origin")).toBe("https://expo.dev");
     expect(await res.text()).toContain(`--display=${id}`);
   }
-  expect(captures).toHaveLength(1); expect(captures[0]?.udid).toBe(UDID);
+  expect(captures).toHaveLength(3);
+  for(let i=0;i<100&&stops<3;i++) await Bun.sleep(5);
+  expect(stops).toBe(3); expect(captures[0]?.udid).toBe(UDID);
   expect(captures[0]?.settings).toMatchObject({ h264Bitrate: 2_300_000, h264Fps: 24, maxDimension: 720 });
 });
 test("HTTP recaptures a panel switch and bounds an unstable fold", async () => {
   sequence = [1, 3, 3]; const stable = await shot(); expect(stable.status).toBe(200); expect(await stable.text()).toContain("--display=3");
-  sequence = [1, 3, 1, 3]; const unstable = await shot(); expect(unstable.status).toBe(500); expect(await unstable.text()).toContain("kept changing");
+  sequence = [1, 3, 1, 3]; const unstable = await shot(); expect(unstable.status).toBe(500); expect(await unstable.text()).toBe(JSON.stringify({ok:false,error:"Simulator screenshot failed"}));
 });
 test("HTTP explicit display avoids native startup and rejects invalid IDs", async () => {
   startupError = new Error("Must not start capture");
@@ -73,4 +76,10 @@ test("HTTP and host action surface real session startup failure before simctl", 
 test("HTTP fails explicitly when the native active display is unknown", async () => {
   active = new Error("Simulator did not report its active display");
   expect((await shot()).status).toBe(500);
+});
+
+test("HTTP startup errors keep private addon paths in host logs", async () => {
+  startupError = new Error("dlopen /Users/private/build/serve-sim-native.node failed");
+  const res=await shot();expect(res.status).toBe(500);
+  expect(await res.json()).toEqual({ok:false,error:"Simulator screenshot failed"});
 });
