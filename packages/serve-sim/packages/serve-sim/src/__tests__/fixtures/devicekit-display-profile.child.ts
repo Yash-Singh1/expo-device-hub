@@ -7,7 +7,6 @@ import { join } from "path";
 const installedRoot = "/Library/Developer/CoreSimulator/Profiles/DeviceTypes";
 const root = fs.mkdtempSync(join(tmpdir(), "serve-sim-display-profiles-"));
 const readdirSync = fs.readdirSync;
-const execFileSync = childProcess.execFileSync;
 const profiles = [
   ["Single", [{ displayType: "integrated" }, { displayType: "tvOut" }], true],
   ["Duo", [{ displayType: "integrated" }, { displayType: "integrated" }], false],
@@ -32,24 +31,20 @@ for (const [name, displays] of profiles) {
 }
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
-// Redirect only the installed profile root. Keep the real identifier lookup,
-// plist conversion, capability parsing, and integrated-display count.
+// Redirect the installed profile root and return JSON fixture contents at the
+// plutil boundary. Keep the real identifier lookup, parsing, and display count.
 mock.module("fs", () => ({
   ...fs,
   readdirSync: (path: string) => readdirSync(path === installedRoot ? root : path),
 }));
 mock.module("child_process", () => ({
   ...childProcess,
-  execFileSync: (file: string, args: string[], options: childProcess.ExecFileSyncOptions) => {
+  execFileSync: (file: string, args: string[]) => {
     expect(file).toBe("plutil");
     expect(args.slice(0, 4)).toEqual(["-convert", "json", "-o", "-"]);
     const profilePath = args[4];
     if (!profilePath?.startsWith(`${installedRoot}/`)) throw new Error("Unexpected profile path");
-    return execFileSync(
-      file,
-      [...args.slice(0, 4), join(root, profilePath.slice(installedRoot.length))],
-      options,
-    );
+    return fs.readFileSync(join(root, profilePath.slice(installedRoot.length)), "utf8");
   },
 }));
 const { hasSingleIntegratedDisplay } = await import("../../devicekit-chrome");
