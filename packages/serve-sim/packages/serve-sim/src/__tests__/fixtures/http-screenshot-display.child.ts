@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { UDID, installShims, useTempStateDir } from "../helpers";
 import * as native from "../../native";
 import * as ui from "../../ui-settings";
+import * as chrome from "../../devicekit-chrome";
 import type { StreamEncoderSettings } from "../../stream-settings";
 
 let active: number | Error = 1;
@@ -26,22 +27,44 @@ mock.module("../../native", () => ({ ...native, NativeCapture: Capture, NativeHi
   async supportsPhysicalOrientation() { return false; }
 } }));
 mock.module("../../ui-settings", () => ({ ...ui, refreshDeviceOptionState: async () => {} }));
+mock.module("../../devicekit-chrome", () => ({ ...chrome,
+  hasSingleIntegratedDisplay: (identifier: string) => identifier === "fixture.single",
+}));
+const single = "11111111-1111-1111-1111-111111111111";
+const unknown = "22222222-2222-2222-2222-222222222222";
 const temp = useTempStateDir();
 const { simMiddleware } = await import("../../middleware");
 const { closeDeviceSession } = await import("../../device-session");
 const { runHostActionAsync } = await import("../../host-actions");
 const shims = installShims({
-  xcrun: "#!/bin/sh\nfor last; do :; done\nprintf '%s\\n' \"$*\" >> \"$SERVE_SIM_HTTP_SHOTS\"\nprintf '\\211PNG\\r\\n\\032\\n%s' \"$*\" > \"$last\"\n",
+  xcrun: "#!/bin/sh\nif [ \"$2\" = list ]; then printf '%s' \"$SERVE_SIM_HTTP_DEVICES\"; exit 0; fi\nfor last; do :; done\nprintf '%s\\n' \"$*\" >> \"$SERVE_SIM_HTTP_SHOTS\"\nprintf '\\211PNG\\r\\n\\032\\n%s' \"$*\" > \"$last\"\n",
   cp: "#!/bin/sh\nexit 0\n",
 });
 process.env.SERVE_SIM_HTTP_SHOTS = join(shims.dir, "shots");
+process.env.SERVE_SIM_HTTP_DEVICES = JSON.stringify({ devices: { runtime: [
+  { udid: UDID, state: "Booted", name: "Renamed iPhone", deviceTypeIdentifier: "fixture.duo" },
+  { udid: single, state: "Booted", name: "iPhone", deviceTypeIdentifier: "fixture.single" },
+  { udid: unknown, state: "Booted", name: "iPhone", deviceTypeIdentifier: "fixture.unknown" },
+] } });
 const settings = { transport: "webrtc" as const, codec: "vp8" as const, h264Bitrate: 2_300_000, h264Fps: 24, maxDimension: 720 };
 const middleware = simMiddleware({ basePath: "/preview", streamSettings: settings, corsOrigins: ["https://expo.dev"] });
-async function shot(extra = "") {
-  return (await middleware(new Request(`http://localhost/preview/api/screenshot?device=${UDID.toLowerCase()}${extra}`, { method: "POST", headers: { origin: "https://expo.dev" } })))!;
+async function shot(extra = "", device = UDID) {
+  return (await middleware(new Request(`http://localhost/preview/api/screenshot?device=${device.toLowerCase()}${extra}`, { method: "POST", headers: { origin: "https://expo.dev" } })))!;
 }
-afterEach(() => { closeDeviceSession(UDID); active = 1; sequence = []; startupError = undefined; captures.length = 0; stops = 0; });
-afterAll(() => { shims.restore(); temp.restore(); delete process.env.SERVE_SIM_HTTP_SHOTS; });
+afterEach(() => { closeDeviceSession(UDID); closeDeviceSession(single); active = 1; sequence = []; startupError = undefined; captures.length = 0; stops = 0; });
+afterAll(() => { shims.restore(); temp.restore(); delete process.env.SERVE_SIM_HTTP_SHOTS; delete process.env.SERVE_SIM_HTTP_DEVICES; });
+
+test.each(["startup", "readback"])("a single-display device falls back to plain simctl after native %s fails", async failure => {
+  if (failure === "startup") startupError = new Error("Native addon missing");
+  else active = new Error("Native display readback unavailable");
+  const res = await shot("", single);
+  expect(res.status).toBe(200);
+  const png = await res.text();
+  expect(png).toContain(`simctl io ${single} screenshot`);
+  expect(png).not.toContain("--display=");
+  expect((await shot()).status).toBe(500);
+  expect((await shot("", unknown)).status).toBe(500);
+});
 
 test("HTTP screenshots select the active cover or inner panel with trusted startup settings", async () => {
   for (const id of [1, 3, 1]) {
@@ -58,7 +81,8 @@ test("HTTP screenshots select the active cover or inner panel with trusted start
 });
 test("HTTP recaptures a panel switch and bounds an unstable fold", async () => {
   sequence = [1, 3, 3]; const stable = await shot(); expect(stable.status).toBe(200); expect(await stable.text()).toContain("--display=3");
-  sequence = [1, 3, 1, 3]; const unstable = await shot(); expect(unstable.status).toBe(500); expect(await unstable.text()).toBe(JSON.stringify({ok:false,error:"Simulator screenshot failed"}));
+  sequence = [1, 3, 1, 3]; const unstable = await shot(); expect(unstable.status).toBe(500);
+  expect(await unstable.json()).toEqual({ ok: false, error: "The active display kept changing. Retry the screenshot once the fold has finished." });
 });
 test("HTTP explicit display avoids native startup and rejects invalid IDs", async () => {
   startupError = new Error("Must not start capture");

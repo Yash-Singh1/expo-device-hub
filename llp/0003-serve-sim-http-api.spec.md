@@ -571,5 +571,14 @@ selection and three-attempt handoff bound as `screenshot.capture`. Its optional
 `display` query selects an explicit panel without starting native capture. It
 keeps the existing PNG response, artifact headers, and temporary-file cleanup,
 without the host action's Desktop copy. Default HTTP captures share the same
-one-shot session ownership. Capture errors return a generic message; private
-native-startup and simctl diagnostics stay in host logs.
+one-shot session ownership. If native startup or display readback fails, an
+installed device profile with exactly one integrated display permits a plain
+`simctl screenshot` fallback. Unknown profiles and multi-display devices still
+require native panel election. [observed: `simMiddleware` screenshot route,
+`hasSingleIntegratedDisplay`]
+
+Capture errors return a generic message, except for the safe retry guidance
+when the active display keeps changing. Private native-startup and simctl
+diagnostics stay in host logs. The `display` query uses CoreSimulator IDs;
+serve-emu's screenshot route has no equivalent query and retains its existing
+device screenshot behavior. [observed: serve-sim and serve-emu `middleware.ts`]

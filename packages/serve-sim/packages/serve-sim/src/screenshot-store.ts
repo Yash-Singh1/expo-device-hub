@@ -60,13 +60,15 @@ async function isEmptyFileAsync(path: string): Promise<boolean> {
 }
 
 export const ScreenshotDisplay = z.number().int().min(1).max(0xffff_ffff);
+export const SCREENSHOT_DISPLAY_CHANGED =
+  "The active display kept changing. Retry the screenshot once the fold has finished.";
 
 /** Same panel election and bounded retry for host actions and HTTP downloads. */
 export async function captureScreenshotFileAsync(
   p: {
     udid: string;
     file: string;
-    display: number;
+    display?: number;
     timeoutMs?: number;
   },
   readActiveDisplay?: () => Promise<number>,
@@ -75,7 +77,14 @@ export async function captureScreenshotFileAsync(
   for (let attempt = 0; attempt < 3; attempt++) {
     const shot = await runInvocation({
       file: "xcrun",
-      args: ["simctl", "io", p.udid, "screenshot", `--display=${display}`, p.file],
+      args: [
+        "simctl",
+        "io",
+        p.udid,
+        "screenshot",
+        ...(display === undefined ? [] : [`--display=${display}`]),
+        p.file,
+      ],
       timeoutMs: p.timeoutMs,
     });
     if (shot.exitCode !== 0 || !readActiveDisplay) return shot;
@@ -83,11 +92,7 @@ export async function captureScreenshotFileAsync(
     if (current === display) return shot;
     display = current;
   }
-  return {
-    stdout: "",
-    stderr: "The active display kept changing. Retry the screenshot once the fold has finished.",
-    exitCode: 1,
-  };
+  return { stdout: "", stderr: SCREENSHOT_DISPLAY_CHANGED, exitCode: 1 };
 }
 
 export async function captureScreenshotAsync(
