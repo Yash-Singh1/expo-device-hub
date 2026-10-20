@@ -628,8 +628,11 @@ export function hasSingleIntegratedDisplay(identifier: string | undefined): bool
   if (!name) return false;
   const profile = readPlist(join(dirname(profilePathForName(name)), "capabilities.plist"));
   const displays = record(profile?.capabilities).displays;
-  return Array.isArray(displays) && displays.every(display => typeof record(display).displayType === "string") &&
-    displays.filter(display => record(display).displayType === "integrated").length === 1;
+  return (
+    Array.isArray(displays) &&
+    displays.every((display) => typeof record(display).displayType === "string") &&
+    displays.filter((display) => record(display).displayType === "integrated").length === 1
+  );
 }
 
 function iconNameForProfile(profile: DeviceProfileMetadata | null): string | null {

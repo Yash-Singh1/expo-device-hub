@@ -14,7 +14,12 @@ import {
   redactHostPaths,
 } from "./host-actions-utils";
 import { Argument, ConfinedPath, DESKTOP_DIR, SCREENSHOT_DIR } from "./host-paths";
-import { ScreenshotDisplay, ScreenshotName, captureScreenshotAsync, newScreenshotName } from "./screenshot-store";
+import {
+  ScreenshotDisplay,
+  ScreenshotName,
+  captureScreenshotAsync,
+  newScreenshotName,
+} from "./screenshot-store";
 import { approveUrlScheme, launchApp, openUrlInApp, stopApp } from "./launch-manager";
 import { CA_DEBUG_FLAGS } from "./ca-debug";
 import { HINGE_POSITIONS, isHingeAngle } from "./hinge-angle";

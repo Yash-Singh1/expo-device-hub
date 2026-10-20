@@ -1,4 +1,8 @@
-import { captureScreenshotFileAsync, ScreenshotDisplay, SCREENSHOT_DISPLAY_CHANGED } from "./screenshot-store";
+import {
+  captureScreenshotFileAsync,
+  ScreenshotDisplay,
+  SCREENSHOT_DISPLAY_CHANGED,
+} from "./screenshot-store";
 import { openSseStream } from "./sse-stream";
 import { parseCaptureProxy } from "./capture/upstream";
 import { execFile, execSync } from "child_process";
@@ -2798,7 +2802,8 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         return;
       }
       const displayValue = new URL(rawUrl, "http://localhost").searchParams.get("display");
-      const display = displayValue === null ? undefined : ScreenshotDisplay.safeParse(Number(displayValue));
+      const display =
+        displayValue === null ? undefined : ScreenshotDisplay.safeParse(Number(displayValue));
       if (display && !display.success) {
         res.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "Invalid simulator display ID" }));
@@ -2811,17 +2816,22 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         const screenId = display?.data;
         const capture = (id: number, read?: () => Promise<number>) =>
           captureScreenshotFileAsync({ udid, file, display: id, timeoutMs: 5_000 }, read);
-        const result = screenId !== undefined ? await capture(screenId)
-          : await withScreenshotDeviceSession(udid, streamSettings, async session => {
-            const read = () => session.activeScreenId();
-            return await capture(await read(), read);
-          }).catch(async error => {
-            // A sole integrated display needs no native panel election. Never
-            // fall back on an unknown profile or a multi-display device.
-            if (!(await getBootedUdids())?.has(udid) ||
-                !hasSingleIntegratedDisplay(bootedSnapshot.deviceTypes.get(udid))) throw error;
-            return await captureScreenshotFileAsync({ udid, file, timeoutMs: 5_000 });
-          });
+        const result =
+          screenId !== undefined
+            ? await capture(screenId)
+            : await withScreenshotDeviceSession(udid, streamSettings, async (session) => {
+                const read = () => session.activeScreenId();
+                return await capture(await read(), read);
+              }).catch(async (error) => {
+                // A sole integrated display needs no native panel election. Never
+                // fall back on an unknown profile or a multi-display device.
+                if (
+                  !(await getBootedUdids())?.has(udid) ||
+                  !hasSingleIntegratedDisplay(bootedSnapshot.deviceTypes.get(udid))
+                )
+                  throw error;
+                return await captureScreenshotFileAsync({ udid, file, timeoutMs: 5_000 });
+              });
         if (result.exitCode !== 0) throw new Error(result.stderr || "simctl screenshot failed");
         const png = await readFile(file);
         const artifact = await saveScreenshotArtifact(png);
@@ -2849,8 +2859,15 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           "Cache-Control": "no-store",
           "Content-Type": "application/json",
         });
-        res.end(JSON.stringify({ ok: false, error: message === SCREENSHOT_DISPLAY_CHANGED
-          ? SCREENSHOT_DISPLAY_CHANGED : "Simulator screenshot failed" }));
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error:
+              message === SCREENSHOT_DISPLAY_CHANGED
+                ? SCREENSHOT_DISPLAY_CHANGED
+                : "Simulator screenshot failed",
+          }),
+        );
       } finally {
         // Best-effort cleanup; the PNG is already in memory by now.
         await unlink(file).catch(() => {});
