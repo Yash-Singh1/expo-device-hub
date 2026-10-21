@@ -1,3 +1,4 @@
+import { timeStartup } from "./startup-timing";
 import { RECORDING_LEASE_MS } from "./recording-timeouts";
 import { US_KEYBOARD_MAP } from "./text-to-keys";
 /**
@@ -399,8 +400,12 @@ export class DeviceSession {
     if (this.phase === "running") return this.captureStart ?? Promise.resolve();
     if (this.phase === "stopped") return Promise.reject(new Error("Capture session is stopped"));
     this.phase = "running";
-    this.captureStart = refreshDeviceOptionState(this.udid)
-      .then(() => this.capture.start())
+    this.captureStart = timeStartup(
+      "device-options",
+      () => refreshDeviceOptionState(this.udid),
+      this.udid,
+    )
+      .then(() => timeStartup("native-capture", () => this.capture.start(), this.udid))
       .then(async () => {
         const unsubscribe = await this.capture.subscribeScreenChanges(async () => {
           if (this.phase !== "running") return;
@@ -429,7 +434,14 @@ export class DeviceSession {
           .catch((error) => {
             console.error(`[capture] Device state observation unavailable: ${error}`);
           });
-        if (await this.refreshScreenSizeFromNative()) this.broadcastConfig();
+        if (
+          await timeStartup(
+            "screen-configuration",
+            () => this.refreshScreenSizeFromNative(),
+            this.udid,
+          )
+        )
+          this.broadcastConfig();
         this.scheduleScreenRefresh();
         // Discover fold controls without delaying the first frame or inventing
         // an initial angle when CoreDevice has not reported one.
