@@ -5,7 +5,10 @@ import { simMiddleware } from "../middleware";
 import { closeDeviceSession, getDeviceSession, peekDeviceSession } from "../device-session";
 import { locateNativeAddon } from "../native";
 import { locateSimpbArtifact } from "../sim-pasteboard";
-import { PasteboardCopyTimeoutError, copyFromSim as performCopyFromSim } from "../sim-pasteboard-copy";
+import {
+  PasteboardCopyTimeoutError,
+  copyFromSim as performCopyFromSim,
+} from "../sim-pasteboard-copy";
 import {
   COPY_FIXTURE_TEXT,
   ensureFixtureInstalled,
@@ -17,6 +20,7 @@ import {
   sendSimSelectAllShortcut,
   sendSimTap,
   waitForDataMigration,
+  waitForFixtureSelection,
 } from "./pasteboard-sim";
 import { e2eDevice, requireE2E } from "./e2e-preconditions";
 import { useTempStateDir } from "./helpers";
@@ -34,7 +38,12 @@ const describeCopy = copyReady ? describe : describe.skip;
 const describeUserApp = copyReady && pasteboardFixture ? describe : describe.skip;
 const SAFARI_COPY_TEXT = "serve-sim-safari-copy-probe";
 
-async function copyFromSim(): Promise<{ ok?: boolean; text?: string; error?: string; status: number }> {
+async function copyFromSim(): Promise<{
+  ok?: boolean;
+  text?: string;
+  error?: string;
+  status: number;
+}> {
   getDeviceSession(udid!);
   const res = await middleware(
     new Request(
@@ -56,7 +65,9 @@ describeCopy(`toolbar Copy (booted sim ${udid ?? "<skipped>"})`, () => {
     let selectedText = "";
 
     beforeAll(async () => {
-      console.log(`[pasteboard-copy] device session before Safari: ${peekDeviceSession(udid!) ? "existing" : "none"}`);
+      console.log(
+        `[pasteboard-copy] device session before Safari: ${peekDeviceSession(udid!) ? "existing" : "none"}`,
+      );
       // An earlier suite can leave this device's session open; after a reboot, its Command+C no longer reaches the app.
       closeDeviceSession(udid!);
       let markRequested = () => {};
@@ -112,7 +123,8 @@ describeCopy(`toolbar Copy (booted sim ${udid ?? "<skipped>"})`, () => {
           await sendSimTap(udid!, 0.5, 0.5);
           await sendSimSelectAllShortcut(udid!);
           const deadline = Date.now() + 2000;
-          while (!selectedText.includes(SAFARI_COPY_TEXT) && Date.now() < deadline) await Bun.sleep(100);
+          while (!selectedText.includes(SAFARI_COPY_TEXT) && Date.now() < deadline)
+            await Bun.sleep(100);
         }
         const selected = selectedText.includes(SAFARI_COPY_TEXT);
         if (selected) result = await copyFromSim();
@@ -141,7 +153,9 @@ describeCopy(`toolbar Copy (booted sim ${udid ?? "<skipped>"})`, () => {
       const before = items();
       expect(before).toContain("public.html");
       expect(before).toContain("public.utf8-plain-text");
-      await expect(performCopyFromSim(udid!, async () => {})).rejects.toBeInstanceOf(PasteboardCopyTimeoutError);
+      await expect(performCopyFromSim(udid!, async () => {})).rejects.toBeInstanceOf(
+        PasteboardCopyTimeoutError,
+      );
       expect(items()).toBe(before);
     }, 120_000);
   });
@@ -152,7 +166,7 @@ describeCopy(`toolbar Copy (booted sim ${udid ?? "<skipped>"})`, () => {
     beforeAll(async () => {
       ensureFixtureInstalled(udid!);
       session = await launchWithoutReader(udid!, FIXTURE_BUNDLE);
-      await Bun.sleep(300);
+      await waitForFixtureSelection(udid!);
     }, 60_000);
 
     afterAll(() => {
@@ -161,10 +175,18 @@ describeCopy(`toolbar Copy (booted sim ${udid ?? "<skipped>"})`, () => {
     });
 
     test("Copy returns the selected field text", async () => {
-      const body = await copyFromSim();
-      expect(body.status).toBe(200);
-      expect(body.ok).toBe(true);
-      expect(body.text).toBe(COPY_FIXTURE_TEXT);
+      // Copy returns after the first pasteboard change, which another writer can make. If the
+      // text is not the field's, a user would copy again, so the test does too.
+      let body: Awaited<ReturnType<typeof copyFromSim>> | undefined;
+      for (let attempt = 0; attempt < 3 && body?.text !== COPY_FIXTURE_TEXT; attempt++) {
+        body = await copyFromSim();
+        console.log(
+          `[pasteboard-copy] user app Copy attempt ${attempt + 1}: status ${body.status}`,
+        );
+      }
+      expect(body?.status).toBe(200);
+      expect(body?.ok).toBe(true);
+      expect(body?.text).toBe(COPY_FIXTURE_TEXT);
     }, 45_000);
   });
 });

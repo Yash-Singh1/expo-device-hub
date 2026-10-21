@@ -17,6 +17,7 @@ import {
   pasteboardTool,
   runningPid,
   terminatePasteboardApps,
+  waitForHostPasteboard,
   withSkipPbpaste,
   writeTestPasteboard,
 } from "./pasteboard-sim";
@@ -49,11 +50,17 @@ for (const app of PASTEBOARD_TEST_APPS) {
     // vmmap refuses to examine Safari, so this runs on our own app. The
     // answer assertions below prove the load either way; this one proves it
     // without trusting the protocol.
-    test.skipIf(app.bundleId !== FIXTURE_BUNDLE)("the reader is mapped into the app", () => {
-      expect(
-        mappedDylibCount(udid!, session!.pid, "libSimPasteboardReader.dylib"),
-      ).toBeGreaterThan(0);
-    }, 20_000);
+    test.skipIf(app.bundleId !== FIXTURE_BUNDLE)(
+      "the reader is mapped into the app",
+      async () => {
+        // On iOS 27 the reader is mapped 2 to 3 s after the app opens.
+        const mapped = () => mappedDylibCount(udid!, session!.pid, "libSimPasteboardReader.dylib");
+        const deadline = Date.now() + 10_000;
+        while (mapped() === 0 && Date.now() < deadline) await Bun.sleep(250);
+        expect(mapped()).toBeGreaterThan(0);
+      },
+      20_000,
+    );
 
     test("the dylib answers a request in the app container", async () => {
       const probe = `serve-sim-protocol-probe-${app.label.replace(/\s+/g, "-")}`;
@@ -64,6 +71,7 @@ for (const app of PASTEBOARD_TEST_APPS) {
     test("readSimPasteboardResult returns writer text via pbpaste or inject", async () => {
       const probe = `serve-sim-product-read-${app.label.replace(/\s+/g, "-")}`;
       writeTestPasteboard(udid!, probe);
+      await waitForHostPasteboard(udid!, probe);
       expect((await readSimPasteboardResult(udid!)).text).toBe(probe);
     }, 20_000);
 
@@ -75,9 +83,8 @@ for (const app of PASTEBOARD_TEST_APPS) {
   });
 }
 
-const describeWildcard = udid && pasteboardTool && pasteboardDylib && pasteboardFixture
-  ? describe
-  : describe.skip;
+const describeWildcard =
+  udid && pasteboardTool && pasteboardDylib && pasteboardFixture ? describe : describe.skip;
 
 describeWildcard(`clipboard armed for every app (${udid ?? "<skipped>"})`, () => {
   afterAll(() => {
@@ -134,21 +141,24 @@ describeWildcard(`clipboard from an untracked app (${udid ?? "<skipped>"})`, () 
   }, 60_000);
 });
 
-describeIfInject(`injected pasteboard read with SpringBoard frontmost (${udid ?? "<skipped>"})`, () => {
-  afterAll(() => {
-    clearLaunchState(udid!);
-    removeCapabilityLoaderSync(udid!);
-  });
+describeIfInject(
+  `injected pasteboard read with SpringBoard frontmost (${udid ?? "<skipped>"})`,
+  () => {
+    afterAll(() => {
+      clearLaunchState(udid!);
+      removeCapabilityLoaderSync(udid!);
+    });
 
-  test("tells you to open an app without restarting SpringBoard", async () => {
-    await armClipboardForAllApps(udid!);
-    terminatePasteboardApps(udid!);
-    const pid = runningPid(udid!, "com.apple.SpringBoard");
-    expect(pid).not.toBeNull();
-    await Bun.sleep(1000);
-    await expect(withSkipPbpaste(() => readSimPasteboardResult(udid!))).rejects.toThrow(
-      /Open the app you copied from/,
-    );
-    expect(runningPid(udid!, "com.apple.SpringBoard")).toBe(pid);
-  }, 20_000);
-});
+    test("tells you to open an app without restarting SpringBoard", async () => {
+      await armClipboardForAllApps(udid!);
+      terminatePasteboardApps(udid!);
+      const pid = runningPid(udid!, "com.apple.SpringBoard");
+      expect(pid).not.toBeNull();
+      await Bun.sleep(1000);
+      await expect(withSkipPbpaste(() => readSimPasteboardResult(udid!))).rejects.toThrow(
+        /Open the app you copied from/,
+      );
+      expect(runningPid(udid!, "com.apple.SpringBoard")).toBe(pid);
+    }, 20_000);
+  },
+);

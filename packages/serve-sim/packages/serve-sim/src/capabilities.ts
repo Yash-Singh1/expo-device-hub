@@ -31,6 +31,8 @@ export interface CapabilityDefinition {
   /** Delay before loading on the app main queue; defaults to zero. */
   loadDelayMs?: number;
   loadPhase?: CapabilityLoadPhase;
+  /** The dylib path if it is already built, without building it; null when enabling would build it. */
+  prebuiltDylib?(): string | null;
   /** Starts/stops host resources. Return null to decline enabling. */
   setEnabled(ctx: CapabilityContext): Promise<PreparedCapability | null>;
 }
@@ -90,7 +92,10 @@ export class UnknownCapabilityError extends Error {
  * Requested capabilities that did not apply. A name that `--disable` also names is left out: disable
  * wins, so it is not expected to apply.
  */
-export function missingCapabilities({ enable = [], disable = [] }: CapabilityOverrides, applied: readonly string[]): string[] {
+export function missingCapabilities(
+  { enable = [], disable = [] }: CapabilityOverrides,
+  applied: readonly string[],
+): string[] {
   return enable.filter((name) => !disable.includes(name) && !applied.includes(name));
 }
 
