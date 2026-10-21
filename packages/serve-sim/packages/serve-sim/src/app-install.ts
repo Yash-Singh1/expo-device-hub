@@ -54,7 +54,11 @@ async function appsIn(directory: string): Promise<string[]> {
   return apps;
 }
 
-export async function installAppAsync(udid: string, path: string, deadline = Date.now() + actionTimeoutMs()): Promise<HostActionResult> {
+export async function installAppAsync(
+  udid: string,
+  path: string,
+  deadline = Date.now() + actionTimeoutMs(),
+): Promise<HostActionResult> {
   const remaining = (): number => {
     const ms = deadline - Date.now();
     if (ms <= 0) throw new Error("App installation timed out.");
@@ -62,7 +66,8 @@ export async function installAppAsync(udid: string, path: string, deadline = Dat
   };
   try {
     remaining();
-    if (!(await isArchive(path))) return await runInvocation({ ...installAppInvocation(udid, path), timeoutMs: remaining() });
+    if (!(await isArchive(path)))
+      return await runInvocation({ ...installAppInvocation(udid, path), timeoutMs: remaining() });
     return await installArchive(async () => {
       remaining();
       const directory = await mkdtemp(join(tmpdir(), "serve-sim-app-install-"));
@@ -79,7 +84,10 @@ export async function installAppAsync(udid: string, path: string, deadline = Dat
           filter(name, entry) {
             let error: string | undefined;
             if (!safeArchivePath(name)) error = "App archive contains an unsafe path.";
-            else if (!("type" in entry) || !["File", "Directory", "SymbolicLink", "Link"].includes(entry.type))
+            else if (
+              !("type" in entry) ||
+              !["File", "Directory", "SymbolicLink", "Link"].includes(entry.type)
+            )
               error = "App archive contains an unsupported entry.";
             else {
               bytes += entry.size;
@@ -88,11 +96,19 @@ export async function installAppAsync(udid: string, path: string, deadline = Dat
                 error = "App archive exceeds the expanded size limit.";
               if (entry.type === "SymbolicLink" || entry.type === "Link") {
                 const linkpath = entry.linkpath ?? "";
-                const target = entry.type === "SymbolicLink" ? posix.join(posix.dirname(name), linkpath) : linkpath;
-                if (!linkpath || posix.isAbsolute(linkpath) || !safeArchivePath(posix.normalize(target)))
+                const target =
+                  entry.type === "SymbolicLink"
+                    ? posix.join(posix.dirname(name), linkpath)
+                    : linkpath;
+                if (
+                  !linkpath ||
+                  posix.isAbsolute(linkpath) ||
+                  !safeArchivePath(posix.normalize(target))
+                )
                   error = "App archive contains an unsafe link.";
               }
-              entry.mode = ((entry.mode ?? 0) & 0o777) | (entry.type === "Directory" ? 0o700 : 0o600);
+              entry.mode =
+                ((entry.mode ?? 0) & 0o777) | (entry.type === "Directory" ? 0o700 : 0o600);
             }
             if (error) {
               unpack.abort(new Error(error));
@@ -101,15 +117,24 @@ export async function installAppAsync(udid: string, path: string, deadline = Dat
             return true;
           },
         });
-        await pipeline(createReadStream(path), unpack, { signal: AbortSignal.timeout(remaining()) });
+        await pipeline(createReadStream(path), unpack, {
+          signal: AbortSignal.timeout(remaining()),
+        });
         const apps = await appsIn(directory);
         if (apps.length !== 1) throw new Error("App archive must contain exactly one .app bundle.");
-        return await runInvocation({ ...installAppInvocation(udid, apps[0]!), timeoutMs: remaining() });
+        return await runInvocation({
+          ...installAppInvocation(udid, apps[0]!),
+          timeoutMs: remaining(),
+        });
       } finally {
         await rm(directory, { recursive: true, force: true });
       }
     });
   } catch (error) {
-    return { stdout: "", stderr: redactHostPaths(error instanceof Error ? error.message : String(error)), exitCode: 1 };
+    return {
+      stdout: "",
+      stderr: redactHostPaths(error instanceof Error ? error.message : String(error)),
+      exitCode: 1,
+    };
   }
 }

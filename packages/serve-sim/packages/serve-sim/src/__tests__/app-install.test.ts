@@ -49,7 +49,7 @@ test("installs a direct app bundle", async () => {
 });
 test.each(["Device.ipa", "Device.IPA", "Build.zip", "uploaded-without-extension"])(
   "rejects unsupported install files before invoking simctl: %s",
-  async name => {
+  async (name) => {
     const file = join(root, name);
     await writeFile(file, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
     const started = join(root, `unsupported-${name}-started`);
@@ -57,7 +57,9 @@ test.each(["Device.ipa", "Device.IPA", "Build.zip", "uploaded-without-extension"
     try {
       expect(await install(file)).toMatchObject({
         exitCode: 1,
-        stderr: expect.stringContaining("Simulator installs require a Simulator .app bundle or .tar.gz/.tgz archive."),
+        stderr: expect.stringContaining(
+          "Simulator installs require a Simulator .app bundle or .tar.gz/.tgz archive.",
+        ),
       });
       expect(existsSync(started)).toBe(false);
     } finally {
@@ -68,14 +70,25 @@ test.each(["Device.ipa", "Device.IPA", "Build.zip", "uploaded-without-extension"
 test("rejects an extensionless staged ZIP upload before invoking simctl", async () => {
   const uploadId = "unsupported-staged-archive";
   const started = join(root, "unsupported-staged-started");
-  await runHostActionAsync({
-    action: "upload.append",
-    params: { uploadId, first: true, data: Buffer.from([0x50, 0x4b, 0x03, 0x04]).toString("base64") },
-  }, "unused");
+  await runHostActionAsync(
+    {
+      action: "upload.append",
+      params: {
+        uploadId,
+        first: true,
+        data: Buffer.from([0x50, 0x4b, 0x03, 0x04]).toString("base64"),
+      },
+    },
+    "unused",
+  );
   process.env.SERVE_SIM_INSTALL_STARTED = started;
   try {
-    expect(await runHostActionAsync({ action: "app.install", params: { udid: UDID, uploadId } }, "unused"))
-      .toMatchObject({ exitCode: 1, stderr: expect.stringContaining("Simulator installs require") });
+    expect(
+      await runHostActionAsync(
+        { action: "app.install", params: { udid: UDID, uploadId } },
+        "unused",
+      ),
+    ).toMatchObject({ exitCode: 1, stderr: expect.stringContaining("Simulator installs require") });
     expect(existsSync(started)).toBe(false);
   } finally {
     delete process.env.SERVE_SIM_INSTALL_STARTED;
@@ -138,14 +151,18 @@ test("rejects traversal, absolute paths, and oversized archive entries before in
       stderr: expect.stringContaining("unsafe"),
     });
   }
-  expect(await install(await headerArchive("oversized.tgz", "Huge.app/data", 2 * 1024 ** 3 + 1))).toMatchObject({
+  expect(
+    await install(await headerArchive("oversized.tgz", "Huge.app/data", 2 * 1024 ** 3 + 1)),
+  ).toMatchObject({
     exitCode: 1,
     stderr: expect.stringContaining("size limit"),
   });
 });
 test("rejects links escaping extraction and supports internal bundle links", async () => {
   expect(
-    await install(await headerArchive("bad-link.tgz", "My.app/link", 0, "SymbolicLink", "../../outside")),
+    await install(
+      await headerArchive("bad-link.tgz", "My.app/link", 0, "SymbolicLink", "../../outside"),
+    ),
   ).toMatchObject({ exitCode: 1, stderr: expect.stringContaining("unsafe") });
   await symlink("App", join(root, "My App.app", "Internal"));
   expect((await install(await archive("internal-link.tgz", ["My App.app"]))).exitCode).toBe(0);
@@ -187,7 +204,9 @@ test("removes partially extracted files after an unsafe later entry", async () =
   expect((await install(file)).exitCode).toBe(1);
   await Bun.sleep(50);
   expect(
-    (await readdir(tmpdir())).filter((name) => name.startsWith("serve-sim-app-install-") && !before.includes(name)),
+    (await readdir(tmpdir())).filter(
+      (name) => name.startsWith("serve-sim-app-install-") && !before.includes(name),
+    ),
   ).toEqual([]);
 });
 
@@ -210,7 +229,6 @@ test("keeps extracted entries owner-accessible for install and cleanup", async (
   expect(existsSync(installedPath(result.stdout))).toBe(false);
 });
 
-
 test("installs a highly compressible app below the expanded size limit", async () => {
   await app("Compressible.app");
   await writeFile(join(root, "Compressible.app", "zeros"), Buffer.alloc(20 * 1024 ** 2));
@@ -220,26 +238,53 @@ test("installs a highly compressible app below the expanded size limit", async (
 
 test.each(["../../outside", "../../../etc/passwd", "folder/../../../../outside", "/etc/passwd"])(
   "rejects an escaping symlink target %s",
-  async target => {
-    expect(await install(await headerArchive("escaping-link.tgz", "My.app/link", 0, "SymbolicLink", target)))
-      .toMatchObject({exitCode:1, stderr:expect.stringContaining("unsafe")});
+  async (target) => {
+    expect(
+      await install(
+        await headerArchive("escaping-link.tgz", "My.app/link", 0, "SymbolicLink", target),
+      ),
+    ).toMatchObject({ exitCode: 1, stderr: expect.stringContaining("unsafe") });
   },
 );
 
-test.each(["uploadId", "path"])("staged %s installs exclude removal while waiting for extraction", async source => {
-  const uploadId = `install-reader-${source}`;
-  const bytes = await readFile(await archive(`queued-${source}.tgz`, ["My App.app"]));
-  await runHostActionAsync({action:"upload.append", params:{uploadId, first:true, data:bytes.toString("base64")}}, "unused");
-  process.env.SERVE_SIM_INSTALL_SLEEP = "0.1";
-  try {
-    const first = install(await archive(`ahead-${source}.tgz`, ["My App.app"]));
-    await Bun.sleep(30);
-    const pending = runHostActionAsync({action:"app.install", params:{udid:UDID, [source]:source === "path" ? join(UPLOAD_DIR, uploadId) : uploadId}}, "unused");
-    const removed = runHostActionAsync({action:"upload.remove", params:{uploadId}}, "unused");
-    const results = await Promise.all([first, pending, removed]);
-    expect(results.map(result => result.exitCode), results[1]?.stderr).toEqual([0,0,0]);
-    expect(existsSync(join(UPLOAD_DIR, uploadId))).toBe(false);
-  } finally {
-    delete process.env.SERVE_SIM_INSTALL_SLEEP;
-  }
-});
+test.each(["uploadId", "path"])(
+  "staged %s installs exclude removal while waiting for extraction",
+  async (source) => {
+    const uploadId = `install-reader-${source}`;
+    const bytes = await readFile(await archive(`queued-${source}.tgz`, ["My App.app"]));
+    await runHostActionAsync(
+      {
+        action: "upload.append",
+        params: { uploadId, first: true, data: bytes.toString("base64") },
+      },
+      "unused",
+    );
+    process.env.SERVE_SIM_INSTALL_SLEEP = "0.1";
+    try {
+      const first = install(await archive(`ahead-${source}.tgz`, ["My App.app"]));
+      await Bun.sleep(30);
+      const pending = runHostActionAsync(
+        {
+          action: "app.install",
+          params: {
+            udid: UDID,
+            [source]: source === "path" ? join(UPLOAD_DIR, uploadId) : uploadId,
+          },
+        },
+        "unused",
+      );
+      const removed = runHostActionAsync(
+        { action: "upload.remove", params: { uploadId } },
+        "unused",
+      );
+      const results = await Promise.all([first, pending, removed]);
+      expect(
+        results.map((result) => result.exitCode),
+        results[1]?.stderr,
+      ).toEqual([0, 0, 0]);
+      expect(existsSync(join(UPLOAD_DIR, uploadId))).toBe(false);
+    } finally {
+      delete process.env.SERVE_SIM_INSTALL_SLEEP;
+    }
+  },
+);
