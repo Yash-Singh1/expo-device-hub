@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { readdir, rm, stat, writeFile } from "fs/promises";
+import { readdir, rename, rm, stat, writeFile } from "fs/promises";
 import { join } from "path";
 import { z } from "zod";
 
@@ -132,14 +132,20 @@ export async function captureScreenshotAsync(
     };
   }
   let shot: HostActionResult;
+  // Publish only a validated panel. Each capture owns its work file, so a
+  // failed retry cannot overwrite or remove another capture of the same name.
+  const temporary = join(SCREENSHOT_DIR, `.capture-${randomUUID()}.png`);
   try {
     shot = await captureScreenshotFileAsync(
-      { udid: p.udid, file: staged, display: p.display },
+      { udid: p.udid, file: temporary, display: p.display },
       readActiveDisplay,
     );
+    if (shot.exitCode === 0) await rename(temporary, staged);
   } catch (error) {
     if (await isEmptyFileAsync(staged)) await rm(staged, { force: true });
     throw error;
+  } finally {
+    await rm(temporary, { force: true });
   }
   // Or the reservation holds a ceiling slot until the prune. Only while still empty: a second capture
   // of the same name may have written a real screenshot there since.
