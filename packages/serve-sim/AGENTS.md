@@ -25,11 +25,12 @@ ignore `*.e2e.test.*` files, plus separate Simulator jobs with
 `SERVE_SIM_E2E_REQUIRED=1`. The package and fixtures are built once with pinned
 Xcode 26, and the Simulator jobs use that archive without rebuilding. The e2e files
 are split over two Simulator jobs: one runs `*.slow.e2e.test.ts`, the other runs
-the rest. `.eas/functions/test-sim-runtime` selects each group. Test jobs pass
+all remaining e2e files. `.eas/functions/test-sim-runtime` selects each group.
+The serve-sim workflow runs on a PR that is ready for review; a draft runs it only
+with the `ci-ready` label. Fixture apps must adopt the scene lifecycle: UIKit
+stops an app linked with the iOS 27 SDK at launch if it does not. Test jobs pass
 `--retry=1`, so a failed test runs once more; a failed `beforeAll` and a file that
-fails to load stay red. Local checks do not replace the CI run. The serve-sim
-workflow runs on a PR that is ready for review; a draft runs it only with the
-`ci-ready` label.
+fails to load stay red. Local checks do not replace the CI run.
 
 - `bun run check` — lint, typecheck, and knip. Run before every commit.
 - `bun run build` — full build: bundled JS, compiled CLI, native helpers, and
@@ -59,7 +60,7 @@ workflow runs on a PR that is ready for review; a draft runs it only with the
   kills any server it started and removes its state directory. Export
   `SERVE_SIM_STATE_DIR` yourself to point a run at a server you started, and
   it is left alone. Example: `SERVE_SIM_TEST_UDID=<udid> bun run test:e2e --
-  packages/serve-sim/src/__tests__/permissions.e2e.test.ts`.
+packages/serve-sim/src/__tests__/permissions.e2e.test.ts`.
 - The full `test:e2e` run checks mitmdump before building fixtures. CI checks
   it before each unit or Simulator test job. The shared probe uses capture's
   binary selection

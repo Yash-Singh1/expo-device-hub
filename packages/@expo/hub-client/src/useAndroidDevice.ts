@@ -50,6 +50,7 @@ import {
 import { androidStreamSettingsPatch, parseAndroidStreamSettings } from "./android-stream-settings";
 import { androidStreamSourceErrorMessage, parseAndroidStreamSource } from "./android-stream-source";
 import { androidTouchMessage } from "./android-touch";
+import { NO_CLIPBOARD } from "./device-clipboard";
 import { mergeAuthoritativeDeviceSetting } from "./device-setting-writes";
 import { buildCodecString, isWebCodecsSupported, parseFramePacket, scanAU } from "./h264";
 import { KeyedWriteTracker } from "./keyed-write-tracker";
@@ -2070,6 +2071,8 @@ export function useAndroidDeviceClient(options: DeviceConnectionOptions): Device
       location: locationCapabilities,
       permissions: permissionsAvailable,
       streamSettings: ANDROID_STREAM_SETTING_CAPABILITIES,
+      // serve-emu has no clipboard API.
+      clipboard: false,
     }),
     [cameraSupported, accessibilityAvailable, locationCapabilities, permissionsAvailable],
   );
@@ -2118,6 +2121,7 @@ export function useAndroidDeviceClient(options: DeviceConnectionOptions): Device
     setLocation,
     clearLocation,
     ...appPermissions,
+    ...NO_CLIPBOARD,
     streamSettings,
     streamSettingsPending:
       streamSettingsPending || streamSourceLoading || isStreamSwitchPending(streamSwitch),

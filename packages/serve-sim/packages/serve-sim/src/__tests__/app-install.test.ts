@@ -61,7 +61,7 @@ test("installs a direct app bundle", async () => {
 });
 test.each(["Device.ipa", "Device.IPA", "Build.zip", "uploaded-without-extension"])(
   "rejects unsupported install files before invoking simctl: %s",
-  async name => {
+  async (name) => {
     const file = join(root, name);
     await writeFile(file, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
     const started = join(root, `unsupported-${name}-started`);
@@ -69,7 +69,9 @@ test.each(["Device.ipa", "Device.IPA", "Build.zip", "uploaded-without-extension"
     try {
       expect(await install(file)).toMatchObject({
         exitCode: 1,
-        stderr: expect.stringContaining("Simulator installs require a Simulator .app bundle or .tar.gz/.tgz archive."),
+        stderr: expect.stringContaining(
+          "Simulator installs require a Simulator .app bundle or .tar.gz/.tgz archive.",
+        ),
       });
       expect(existsSync(started)).toBe(false);
     } finally {
@@ -80,14 +82,25 @@ test.each(["Device.ipa", "Device.IPA", "Build.zip", "uploaded-without-extension"
 test("rejects an extensionless staged ZIP upload before invoking simctl", async () => {
   const uploadId = "unsupported-staged-archive";
   const started = join(root, "unsupported-staged-started");
-  await runHostActionAsync({
-    action: "upload.append",
-    params: { uploadId, first: true, data: Buffer.from([0x50, 0x4b, 0x03, 0x04]).toString("base64") },
-  }, "unused");
+  await runHostActionAsync(
+    {
+      action: "upload.append",
+      params: {
+        uploadId,
+        first: true,
+        data: Buffer.from([0x50, 0x4b, 0x03, 0x04]).toString("base64"),
+      },
+    },
+    "unused",
+  );
   process.env.SERVE_SIM_INSTALL_STARTED = started;
   try {
-    expect(await runHostActionAsync({ action: "app.install", params: { udid: UDID, uploadId } }, "unused"))
-      .toMatchObject({ exitCode: 1, stderr: expect.stringContaining("Simulator installs require") });
+    expect(
+      await runHostActionAsync(
+        { action: "app.install", params: { udid: UDID, uploadId } },
+        "unused",
+      ),
+    ).toMatchObject({ exitCode: 1, stderr: expect.stringContaining("Simulator installs require") });
     expect(existsSync(started)).toBe(false);
   } finally {
     delete process.env.SERVE_SIM_INSTALL_STARTED;
@@ -150,14 +163,18 @@ test("rejects traversal, absolute paths, and oversized archive entries before in
       stderr: expect.stringContaining("unsafe"),
     });
   }
-  expect(await install(await headerArchive("oversized.tgz", "Huge.app/data", 2 * 1024 ** 3 + 1))).toMatchObject({
+  expect(
+    await install(await headerArchive("oversized.tgz", "Huge.app/data", 2 * 1024 ** 3 + 1)),
+  ).toMatchObject({
     exitCode: 1,
     stderr: expect.stringContaining("size limit"),
   });
 });
 test("rejects links escaping extraction and supports internal bundle links", async () => {
   expect(
-    await install(await headerArchive("bad-link.tgz", "My.app/link", 0, "SymbolicLink", "../../outside")),
+    await install(
+      await headerArchive("bad-link.tgz", "My.app/link", 0, "SymbolicLink", "../../outside"),
+    ),
   ).toMatchObject({ exitCode: 1, stderr: expect.stringContaining("unsafe") });
   await symlink("App", join(root, "My App.app", "Internal"));
   expect((await install(await archive("internal-link.tgz", ["My App.app"]))).exitCode).toBe(0);
@@ -199,7 +216,9 @@ test("removes partially extracted files after an unsafe later entry", async () =
   expect((await install(file)).exitCode).toBe(1);
   await Bun.sleep(50);
   expect(
-    (await readdir(tmpdir())).filter((name) => name.startsWith("serve-sim-app-install-") && !before.includes(name)),
+    (await readdir(tmpdir())).filter(
+      (name) => name.startsWith("serve-sim-app-install-") && !before.includes(name),
+    ),
   ).toEqual([]);
 });
 
@@ -222,7 +241,6 @@ test("keeps extracted entries owner-accessible for install and cleanup", async (
   expect(existsSync(installedPath(result.stdout))).toBe(false);
 });
 
-
 test("installs a highly compressible app below the expanded size limit", async () => {
   await app("Compressible.app");
   await writeFile(join(root, "Compressible.app", "zeros"), Buffer.alloc(20 * 1024 ** 2));
@@ -232,29 +250,56 @@ test("installs a highly compressible app below the expanded size limit", async (
 
 test.each(["../../outside", "../../../etc/passwd", "folder/../../../../outside", "/etc/passwd"])(
   "rejects an escaping symlink target %s",
-  async target => {
-    expect(await install(await headerArchive("escaping-link.tgz", "My.app/link", 0, "SymbolicLink", target)))
-      .toMatchObject({exitCode:1, stderr:expect.stringContaining("unsafe")});
+  async (target) => {
+    expect(
+      await install(
+        await headerArchive("escaping-link.tgz", "My.app/link", 0, "SymbolicLink", target),
+      ),
+    ).toMatchObject({ exitCode: 1, stderr: expect.stringContaining("unsafe") });
   },
 );
 
-test.each(["uploadId", "path"])("staged %s installs exclude removal while waiting for extraction", async source => {
-  const uploadId = `install-reader-${source}`;
-  const bytes = await readFile(await archive(`queued-${source}.tgz`, ["My App.app"]));
-  await runHostActionAsync({action:"upload.append", params:{uploadId, first:true, data:bytes.toString("base64")}}, "unused");
-  process.env.SERVE_SIM_INSTALL_SLEEP = "0.1";
-  try {
-    const first = install(await archive(`ahead-${source}.tgz`, ["My App.app"]));
-    await Bun.sleep(30);
-    const pending = runHostActionAsync({action:"app.install", params:{udid:UDID, [source]:source === "path" ? join(UPLOAD_DIR, uploadId) : uploadId}}, "unused");
-    const removed = runHostActionAsync({action:"upload.remove", params:{uploadId}}, "unused");
-    const results = await Promise.all([first, pending, removed]);
-    expect(results.map(result => result.exitCode), results[1]?.stderr).toEqual([0,0,0]);
-    expect(existsSync(join(UPLOAD_DIR, uploadId))).toBe(false);
-  } finally {
-    delete process.env.SERVE_SIM_INSTALL_SLEEP;
-  }
-});
+test.each(["uploadId", "path"])(
+  "staged %s installs exclude removal while waiting for extraction",
+  async (source) => {
+    const uploadId = `install-reader-${source}`;
+    const bytes = await readFile(await archive(`queued-${source}.tgz`, ["My App.app"]));
+    await runHostActionAsync(
+      {
+        action: "upload.append",
+        params: { uploadId, first: true, data: bytes.toString("base64") },
+      },
+      "unused",
+    );
+    process.env.SERVE_SIM_INSTALL_SLEEP = "0.1";
+    try {
+      const first = install(await archive(`ahead-${source}.tgz`, ["My App.app"]));
+      await Bun.sleep(30);
+      const pending = runHostActionAsync(
+        {
+          action: "app.install",
+          params: {
+            udid: UDID,
+            [source]: source === "path" ? join(UPLOAD_DIR, uploadId) : uploadId,
+          },
+        },
+        "unused",
+      );
+      const removed = runHostActionAsync(
+        { action: "upload.remove", params: { uploadId } },
+        "unused",
+      );
+      const results = await Promise.all([first, pending, removed]);
+      expect(
+        results.map((result) => result.exitCode),
+        results[1]?.stderr,
+      ).toEqual([0, 0, 0]);
+      expect(existsSync(join(UPLOAD_DIR, uploadId))).toBe(false);
+    } finally {
+      delete process.env.SERVE_SIM_INSTALL_SLEEP;
+    }
+  },
+);
 
 test("a slow staged install does not block unrelated uploads or removals", async () => {
   await app();
@@ -343,9 +388,9 @@ test("private upload snapshots survive source removal, clean failures, and enfor
     await writeFile(sparseFile, "");
     try {
       await truncate(sparseFile, 2 * 1024 ** 3 + 1);
-      await expect(
-        withStagedUploadSnapshotAsync(uploadId, async () => {}),
-      ).rejects.toThrow("staging is full");
+      await expect(withStagedUploadSnapshotAsync(uploadId, async () => {})).rejects.toThrow(
+        "staging is full",
+      );
     } finally {
       await rm(oversized, { recursive: true, force: true });
     }
@@ -508,7 +553,8 @@ test("snapshot copying is bounded by the remaining action deadline", async () =>
 test("a staged app with relative framework links survives source pruning during install", async () => {
   const uploadId = "FrameworkLinks.app";
   const source = join(UPLOAD_DIR, uploadId);
-  const started = join(root, "links-install-started"), gate = join(root, "links-install-release");
+  const started = join(root, "links-install-started"),
+    gate = join(root, "links-install-release");
   const trigger = "prune-framework-source";
   await mkdir(join(source, "Versions", "A"), { recursive: true });
   await writeFile(join(source, "Info.plist"), "test app");
@@ -525,9 +571,21 @@ test("a staged app with relative framework links survives source pruning during 
     pending = install(source);
     for (let n = 0; n < 200 && !existsSync(started); n++) await Bun.sleep(10);
     expect(existsSync(started)).toBe(true);
-    expect((await runHostActionAsync({ action: "upload.append", params: {
-      uploadId: trigger, first: true, data: Buffer.from("unrelated upload").toString("base64"),
-    } }, "unused")).exitCode).toBe(0);
+    expect(
+      (
+        await runHostActionAsync(
+          {
+            action: "upload.append",
+            params: {
+              uploadId: trigger,
+              first: true,
+              data: Buffer.from("unrelated upload").toString("base64"),
+            },
+          },
+          "unused",
+        )
+      ).exitCode,
+    ).toBe(0);
     expect(existsSync(source)).toBe(false);
     await writeFile(gate, "release");
     const result = await pending;
@@ -544,43 +602,70 @@ test("a staged app with relative framework links survives source pruning during 
   }
 });
 
-test.each(["absolute-internal", "absolute-external", "relative-escape", "directory-alias-escape", "casefold-alias-escape", "unicode-alias-escape", "dangling", "file-as-directory", "cycle"])(
-  "rejects unsafe staged app links before accepting a snapshot: %s",
-  async kind => {
-    const uploadId = `Unsafe-${kind}.app`, source = join(UPLOAD_DIR, uploadId);
-    await mkdir(source);
-    await writeFile(join(source, "Executable"), "original bytes");
-    const before = (await readdir(UPLOAD_DIR)).filter(name => name.startsWith(".install-snapshot-"));
-    const target = kind === "absolute-internal" ? join(source, "Executable")
-      : kind === "absolute-external" ? join(root, "outside")
-      : kind === "relative-escape" ? "../outside"
-      : kind === "directory-alias-escape" ? "Root/../outside"
-      : kind === "casefold-alias-escape" ? "ROOT/../outside"
-      : kind === "unicode-alias-escape" ? "Ro\u0301o\u0301t/../outside"
-      : kind === "dangling" ? "missing"
-      : kind === "file-as-directory" ? "Executable/../Executable" : "App";
-    if (["directory-alias-escape", "casefold-alias-escape"].includes(kind)) await symlink(".", join(source, "Root"));
-    if (kind === "unicode-alias-escape") await symlink(".", join(source, "Róót"));
-    await symlink(target, join(source, "App"));
-    let accepted = false;
-    try {
-      await expect(withStagedUploadSnapshotAsync(uploadId, async () => { accepted = true; }))
-        .rejects.toThrow("symlinks must be relative and stay inside the app bundle");
-      expect(accepted).toBe(false);
-      expect((await readdir(UPLOAD_DIR)).filter(name => name.startsWith(".install-snapshot-"))).toEqual(before);
-    } finally {
-      await rm(source, { recursive: true, force: true });
-    }
-  },
-);
+test.each([
+  "absolute-internal",
+  "absolute-external",
+  "relative-escape",
+  "directory-alias-escape",
+  "casefold-alias-escape",
+  "unicode-alias-escape",
+  "dangling",
+  "file-as-directory",
+  "cycle",
+])("rejects unsafe staged app links before accepting a snapshot: %s", async (kind) => {
+  const uploadId = `Unsafe-${kind}.app`,
+    source = join(UPLOAD_DIR, uploadId);
+  await mkdir(source);
+  await writeFile(join(source, "Executable"), "original bytes");
+  const before = (await readdir(UPLOAD_DIR)).filter((name) =>
+    name.startsWith(".install-snapshot-"),
+  );
+  const target =
+    kind === "absolute-internal"
+      ? join(source, "Executable")
+      : kind === "absolute-external"
+        ? join(root, "outside")
+        : kind === "relative-escape"
+          ? "../outside"
+          : kind === "directory-alias-escape"
+            ? "Root/../outside"
+            : kind === "casefold-alias-escape"
+              ? "ROOT/../outside"
+              : kind === "unicode-alias-escape"
+                ? "Ro\u0301o\u0301t/../outside"
+                : kind === "dangling"
+                  ? "missing"
+                  : kind === "file-as-directory"
+                    ? "Executable/../Executable"
+                    : "App";
+  if (["directory-alias-escape", "casefold-alias-escape"].includes(kind))
+    await symlink(".", join(source, "Root"));
+  if (kind === "unicode-alias-escape") await symlink(".", join(source, "Róót"));
+  await symlink(target, join(source, "App"));
+  let accepted = false;
+  try {
+    await expect(
+      withStagedUploadSnapshotAsync(uploadId, async () => {
+        accepted = true;
+      }),
+    ).rejects.toThrow("symlinks must be relative and stay inside the app bundle");
+    expect(accepted).toBe(false);
+    expect(
+      (await readdir(UPLOAD_DIR)).filter((name) => name.startsWith(".install-snapshot-")),
+    ).toEqual(before);
+  } finally {
+    await rm(source, { recursive: true, force: true });
+  }
+});
 
 test("relative parent links that remain inside a staged app are preserved", async () => {
-  const uploadId = "RelativeParent.app", source = join(UPLOAD_DIR, uploadId);
+  const uploadId = "RelativeParent.app",
+    source = join(UPLOAD_DIR, uploadId);
   await mkdir(join(source, "Nested"), { recursive: true });
   await writeFile(join(source, "Info.plist"), "bundle metadata");
   await symlink("../Info.plist", join(source, "Nested", "Metadata"));
   try {
-    await withStagedUploadSnapshotAsync(uploadId, async path => {
+    await withStagedUploadSnapshotAsync(uploadId, async (path) => {
       await rm(source, { recursive: true });
       expect(await readFile(join(path, "Nested", "Metadata"), "utf8")).toBe("bundle metadata");
     });
@@ -589,23 +674,27 @@ test("relative parent links that remain inside a staged app are preserved", asyn
   }
 });
 
-test.each([32, 33])("staged app link chains respect the macOS hop limit: %s", async hops => {
-  const uploadId = `Chain-${hops}.app`, source = join(UPLOAD_DIR, uploadId);
+test.each([32, 33])("staged app link chains respect the macOS hop limit: %s", async (hops) => {
+  const uploadId = `Chain-${hops}.app`,
+    source = join(UPLOAD_DIR, uploadId);
   await mkdir(source);
   await writeFile(join(source, "Executable"), "bundle bytes");
   for (let n = 0; n < hops; n++) {
     await symlink(n + 1 === hops ? "Executable" : `Link${n + 1}`, join(source, `Link${n}`));
   }
   let accepted = false;
-  const snapshot = () => withStagedUploadSnapshotAsync(uploadId, async path => {
-    accepted = true;
-    await rm(source, { recursive: true });
-    expect(await readFile(join(path, "Link0"), "utf8")).toBe("bundle bytes");
-  });
+  const snapshot = () =>
+    withStagedUploadSnapshotAsync(uploadId, async (path) => {
+      accepted = true;
+      await rm(source, { recursive: true });
+      expect(await readFile(join(path, "Link0"), "utf8")).toBe("bundle bytes");
+    });
   try {
     if (hops === 32) await snapshot();
     else {
-      await expect(snapshot()).rejects.toThrow("symlinks must be relative and stay inside the app bundle");
+      await expect(snapshot()).rejects.toThrow(
+        "symlinks must be relative and stay inside the app bundle",
+      );
       expect(accepted).toBe(false);
     }
   } finally {

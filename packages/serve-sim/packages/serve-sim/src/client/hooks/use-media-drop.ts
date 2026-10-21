@@ -33,9 +33,7 @@ export function startHostPathDrop({
   onUploadProgress(id, null);
   return addHostMediaToPhotos(hostPath, udid)
     .then(() => onUploadEnd(id, true))
-    .catch((err) =>
-      onUploadEnd(id, false, err instanceof Error ? err.message : "Add failed"),
-    );
+    .catch((err) => onUploadEnd(id, false, err instanceof Error ? err.message : "Add failed"));
 }
 
 export function useMediaDrop({
@@ -104,15 +102,7 @@ export function useMediaDrop({
           );
       }
     },
-    [
-      enabled,
-      udid,
-      onUploadStart,
-      onUploadProgress,
-      onUploadEnd,
-      onUnsupported,
-      onHostPathDrop,
-    ],
+    [enabled, udid, onUploadStart, onUploadProgress, onUploadEnd, onUnsupported, onHostPathDrop],
   );
 
   const onDragOver = useCallback(

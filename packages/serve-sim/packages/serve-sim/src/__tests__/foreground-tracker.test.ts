@@ -12,28 +12,55 @@ import {
 import { withShimsAsync } from "./helpers";
 
 test("history lookup keeps the latest app after more than 16 MiB of logs", async () => {
-  await withShimsAsync({
-    xcrun: `#!/usr/bin/env bun
+  await withShimsAsync(
+    {
+      xcrun: `#!/usr/bin/env bun
 const old = JSON.stringify({ eventMessage: "[app<com.example.old>:10] Setting process visibility to: Foreground" }) + "\\n";
 process.stdout.write(old.repeat(200000));
 process.stdout.write(JSON.stringify({ eventMessage: "[app<com.example.current>:42] Setting process visibility to: Foreground" }) + "\\n");
 `,
-  }, async () => {
-    expect(await frontmostAppFromRecentLogs("FAKE-DEVICE")).toEqual({ bundleId: "com.example.current", pid: 42 });
-  });
+    },
+    async () => {
+      expect(await frontmostAppFromRecentLogs("FAKE-DEVICE")).toEqual({
+        bundleId: "com.example.current",
+        pid: 42,
+      });
+    },
+  );
 });
 
 test("history lookup reports no app when the latest visible app went to the background", async () => {
-  await withShimsAsync({
-    xcrun: `#!/usr/bin/env bun
+  await withShimsAsync(
+    {
+      xcrun: `#!/usr/bin/env bun
 for (const state of ["Foreground", "Background"]) {
   console.log(JSON.stringify({ eventMessage: "[app<com.example.app>:42] Setting process visibility to: " + state }));
 }
 `,
-  }, async () => {
-    expect(await frontmostAppFromRecentLogs("FAKE-DEVICE")).toBeNull();
-  });
+    },
+    async () => {
+      expect(await frontmostAppFromRecentLogs("FAKE-DEVICE")).toBeNull();
+    },
+  );
 });
+
+test.each([false, true])(
+  "history drops the old app during a pending launch (bootstrapped: %s)",
+  async (bootstrapped) => {
+    const lines = [logChunk("dev.expo.A", 42), logChunk("dev.expo.B", -1)];
+    if (bootstrapped) lines.push(bootstrapChunk("dev.expo.B", 43));
+    await withShimsAsync(
+      {
+        xcrun: `#!/bin/sh\nprintf '%s' '${Buffer.concat(lines).toString()}'\n`,
+      },
+      async () => {
+        expect(await frontmostAppFromRecentLogs("FAKE-DEVICE")).toEqual(
+          bootstrapped ? { bundleId: "dev.expo.B", pid: 43 } : null,
+        );
+      },
+    );
+  },
+);
 
 test("a helper app from AX falls back to the latest visible app in recent history", async () => {
   const app = await frontmostAppOf("FAKE-DEVICE", {
@@ -59,6 +86,11 @@ function fakeChild() {
 
 function logChunk(bundleId: string, pid: number, visibility = "Foreground"): Buffer {
   const eventMessage = `[app<${bundleId}>:${pid}] Setting process visibility to: ${visibility}`;
+  return Buffer.from(JSON.stringify({ eventMessage }) + "\n");
+}
+
+function bootstrapChunk(bundleId: string, pid: number): Buffer {
+  const eventMessage = `[app<${bundleId}>:${pid}] Bootstrap success!`;
   return Buffer.from(JSON.stringify({ eventMessage }) + "\n");
 }
 
@@ -171,6 +203,45 @@ describe("createForegroundTrackerCache", () => {
     sub.unsubscribe();
   });
 
+  test("tracks an app that iOS shows before its process starts", () => {
+    const { cache, children } = trackerWithFakeStream();
+    const seen: ForegroundApp[] = [];
+    const sub = cache.subscribe("UDID", (app) => seen.push(app));
+
+    // On a cold launch, SpringBoard can log the visibility line with pid -1 and never repeat it.
+    children[0]!.stdout.emit("data", logChunk("dev.expo.A", -1));
+    expect(cache.peek("UDID")).toBeNull();
+    children[0]!.stdout.emit("data", bootstrapChunk("dev.expo.A", 3796));
+
+    expect(cache.peek("UDID")).toEqual({ bundleId: "dev.expo.A", pid: 3796 });
+    expect(seen).toEqual([{ bundleId: "dev.expo.A", pid: 3796 }]);
+    sub.unsubscribe();
+  });
+
+  test.each(["dev.expo.A", "dev.expo.B"])("drops the old pid while %s starts", (bundleId) => {
+    const { cache, children } = trackerWithFakeStream();
+    const sub = cache.subscribe("UDID");
+    children[0]!.stdout.emit("data", logChunk("dev.expo.A", 42));
+    children[0]!.stdout.emit("data", logChunk(bundleId, -1));
+    expect(cache.peek("UDID")).toBeNull();
+    children[0]!.stdout.emit("data", bootstrapChunk(bundleId, 43));
+    expect(cache.peek("UDID")).toEqual({ bundleId, pid: 43 });
+    sub.unsubscribe();
+  });
+
+  test("does not track a pending app that leaves the foreground before its process starts", () => {
+    const { cache, children } = trackerWithFakeStream();
+    const sub = cache.subscribe("UDID");
+
+    children[0]!.stdout.emit("data", logChunk("dev.expo.A", -1));
+    children[0]!.stdout.emit("data", logChunk("dev.expo.A", -1, "Background"));
+    children[0]!.stdout.emit("data", bootstrapChunk("dev.expo.A", 3796));
+    children[0]!.stdout.emit("data", bootstrapChunk("dev.expo.B", 4000)); // never shown
+
+    expect(cache.peek("UDID")).toBeNull();
+    sub.unsubscribe();
+  });
+
   test("tells listeners again when a backgrounded app comes back", () => {
     const { cache, children } = trackerWithFakeStream();
     const seen: ForegroundApp[] = [];
@@ -182,7 +253,10 @@ describe("createForegroundTrackerCache", () => {
     child.stdout.emit("data", logChunk("dev.expo.A", 11));
 
     expect(cache.peek("UDID")).toEqual({ bundleId: "dev.expo.A", pid: 11 });
-    expect(seen).toEqual([{ bundleId: "dev.expo.A", pid: 11 }, { bundleId: "dev.expo.A", pid: 11 }]);
+    expect(seen).toEqual([
+      { bundleId: "dev.expo.A", pid: 11 },
+      { bundleId: "dev.expo.A", pid: 11 },
+    ]);
     sub.unsubscribe();
   });
 
@@ -195,7 +269,10 @@ describe("createForegroundTrackerCache", () => {
         children.push(child);
         return child as unknown as ChildProcess;
       },
-      frontmostApp: () => new Promise((resolve) => { seed = resolve; }),
+      frontmostApp: () =>
+        new Promise((resolve) => {
+          seed = resolve;
+        }),
     });
     const sub = cache.subscribe("UDID");
 
@@ -207,6 +284,30 @@ describe("createForegroundTrackerCache", () => {
     expect(cache.peek("UDID")).toBeNull();
     sub.unsubscribe();
   });
+
+  test.each([false, true])(
+    "a slow AX seed cannot overwrite a pending launch (cancelled: %s)",
+    async (cancelled) => {
+      let seed!: (app: ForegroundApp | null) => void;
+      const child = fakeChild();
+      const cache = createForegroundTrackerCache({
+        spawnLogStream: () => child as unknown as ChildProcess,
+        frontmostApp: () =>
+          new Promise((resolve) => {
+            seed = resolve;
+          }),
+      });
+      const seen: ForegroundApp[] = [];
+      const sub = cache.subscribe("UDID", (app) => seen.push(app));
+      child.stdout.emit("data", logChunk("dev.expo.A", -1));
+      if (cancelled) child.stdout.emit("data", logChunk("dev.expo.A", -1, "Background"));
+      seed({ bundleId: "dev.expo.A", pid: 42 });
+      await tick();
+      expect(cache.peek("UDID")).toBeNull();
+      expect(seen).toEqual([]);
+      sub.unsubscribe();
+    },
+  );
 
   test("respawns the log stream when it exits while subscribers remain", async () => {
     const { cache, children } = trackerWithFakeStream(0);
