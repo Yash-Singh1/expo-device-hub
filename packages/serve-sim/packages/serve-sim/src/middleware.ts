@@ -2656,7 +2656,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       const states = await readServeSimStates();
       const state = selectServeSimState(states, selectedDevice);
       if (!state) {
-        reportReadiness("unavailable", "session-not-found", selectedDevice ?? undefined);
+        reportReadiness("unavailable", "session-unavailable", selectedDevice ?? undefined);
         res.writeHead(503, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
@@ -3351,6 +3351,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     ssePrefixes: sseStreamPaths(base),
     onUiRequest: handleUiRequest,
     serveSimBinPath: serveSimBinPath(),
+    deviceName: bootedDeviceName,
     onActionResult: (action, params, result) => recordActionEvent(action, params, result),
     onSseRequest(path, websocketRequest) {
       const url = new URL(path, websocketRequest.url);
