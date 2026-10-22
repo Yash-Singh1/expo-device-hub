@@ -77,6 +77,12 @@ final class H264EncoderFallbackTests: XCTestCase {
                     if output.description != nil { descriptions += 1 }
                 }
             }
+            let initialFallbacks = await encoder.lowLatencyFallbacks
+            if delivered == 12 && initialFallbacks == 0 {
+                await encoder.stop()
+                throw XCTSkip("VideoToolbox did not drop a frame for constrainedBaseline=\(constrainedBaseline)")
+            }
+            XCTAssertLessThan(delivered, 12, "the regression requires a successful frame drop")
             XCTAssertGreaterThan(delivered, 1, "the encoder must continue producing frames after a drop")
             XCTAssertEqual(descriptions, 1, "a dropped frame must not replace the decoder configuration")
             await encoder.update(fps: 30, bitrate: 500_000)
