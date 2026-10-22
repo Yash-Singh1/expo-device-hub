@@ -63,20 +63,31 @@ final class H264EncoderFallbackTests: XCTestCase {
         XCTAssertEqual(fallbacks, 1)
     }
 
-    /// On Apple silicon hosts VideoToolbox drops the second frame of a low-latency session (noErr,
-    /// no sample, kVTEncodeInfo_FrameDropped). The encoder takes the drop for a failure: it falls
-    /// back once, counts it, and sends that frame as a keyframe.
-    func testDroppedSecondFrameFallsBackOnce() async throws {
+    /// A successful VideoToolbox frame drop must not permanently change rate-control mode.
+    func testDroppedFrameKeepsLowLatencySession() async throws {
         try requireLowLatencyRateControl()
-        let encoder = makeEncoder()
-        let flat = try frame()
-        _ = try await encoder.encode(flat)
-        let second = try await encoder.encode(flat)
-        if second.kind == .delta { throw XCTSkip("VideoToolbox kept the second frame on this host") }
-        for _ in 0..<5 {
-            _ = try await encoder.encode(flat)
+        for constrainedBaseline in [false, true] {
+            let encoder = H264Encoder(fps: 60, bitrate: 500_000, constrainedBaseline: constrainedBaseline)
+            let flat = try frame()
+            var descriptions = 0
+            var delivered = 0
+            for _ in 0..<12 {
+                if let output = try await encoder.encode(flat) {
+                    delivered += 1
+                    if output.description != nil { descriptions += 1 }
+                }
+            }
+            XCTAssertGreaterThan(delivered, 1, "the encoder must continue producing frames after a drop")
+            XCTAssertEqual(descriptions, 1, "a dropped frame must not replace the decoder configuration")
+            await encoder.update(fps: 30, bitrate: 500_000)
+            let reset = try await encoder.encode(flat)
+            XCTAssertNotNil(reset?.description)
+            await encoder.stop()
+            let reconnected = try await encoder.encode(flat)
+            XCTAssertNotNil(reconnected?.description)
+            let fallbacks = await encoder.lowLatencyFallbacks
+            XCTAssertEqual(fallbacks, 0)
+            await encoder.stop()
         }
-        let fallbacks = await encoder.lowLatencyFallbacks
-        XCTAssertEqual(fallbacks, 1)
     }
 }

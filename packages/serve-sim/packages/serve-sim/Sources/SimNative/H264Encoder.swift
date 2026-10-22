@@ -41,6 +41,7 @@ actor H264Encoder {
     private var pendingSettings: (fps: Int32, bitrate: Int)?
     private let constrainedBaseline: Bool
     private let dynamicBitrate: Bool
+    private let fallbackOnFrameDrop: Bool
 
     /// Byte and second pairs for the WebRTC shared encoder (dynamic bitrate): the target over one
     /// second, and 1.5 times it over a tenth of a second. AverageBitRate alone let the first frames
@@ -56,11 +57,12 @@ actor H264Encoder {
 
     init(fps: Int = 60, bitrate: Int = 6_000_000,
          constrainedBaseline: Bool = false, dynamicBitrate: Bool = false,
-         lowLatencyRateControl: Bool = true) {
+         lowLatencyRateControl: Bool = true, fallbackOnFrameDrop: Bool = false) {
         self.fps = Int32(max(1, fps))
         self.bitrate = max(1, bitrate)
         self.constrainedBaseline = constrainedBaseline
         self.dynamicBitrate = dynamicBitrate
+        self.fallbackOnFrameDrop = fallbackOnFrameDrop
         self.lowLatencyEnabled = lowLatencyRateControl
     }
 
@@ -68,8 +70,8 @@ actor H264Encoder {
         if let session { VTCompressionSessionInvalidate(session) }
     }
 
-    /// Submit one frame and resume when VideoToolbox returns its sample.
-    func encode(_ source: CVPixelBuffer, forceKeyframe: Bool = false) async throws -> Encoded {
+    /// Submit one frame. A successful rate-control drop returns nil; encode errors throw.
+    func encode(_ source: CVPixelBuffer, forceKeyframe: Bool = false) async throws -> Encoded? {
         let w = Int32(CVPixelBufferGetWidth(source))
         let h = Int32(CVPixelBufferGetHeight(source))
         if session == nil || w != width || h != height {
@@ -96,13 +98,23 @@ actor H264Encoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as NSDictionary
             : nil
 
-        if let buffer = await encodeFrame(
+        let result = await encodeFrame(
             source,
             session: session,
             presentationTimeStamp: pts,
             frameProperties: frameProps
-        ) {
+        )
+        switch result {
+        case let .sample(buffer):
             return try extract(from: buffer)
+        case .dropped:
+            // A successful rate-control drop does not invalidate the session.
+            if !lowLatencyEnabled || !fallbackOnFrameDrop {
+                forceKeyframeAfterReset = effectiveForceKeyframe
+                return nil
+            }
+        case .failed:
+            break
         }
 
         guard lowLatencyEnabled else {
@@ -110,12 +122,9 @@ actor H264Encoder {
             rebuildSession()
             throw Errors.encodingFailed
         }
-        // VideoToolbox drops the second frame of most low-latency sessions (noErr, no sample,
-        // kVTEncodeInfo_FrameDropped), and that drop lands here too, so most sessions run default
-        // rate control from their second frame. We keep that: on EAS, staying on low-latency rate
-        // control dropped about 12 frames a second in full-screen motion, for a latency gain no
-        // benchmark has measured.
-        streamDiagnosticLog("[stream:h264] low-latency encode failed; retrying with default rate control")
+        // Errors and timeouts retain the existing fallback. Shared WebRTC also
+        // opts into fallback on drops to preserve its measured EAS motion throughput.
+        streamDiagnosticLog("[stream:h264] low-latency produced no frame; retrying with default rate control")
         lowLatencyEnabled = false
         lowLatencyFallbacks &+= 1
         forceKeyframeAfterReset = true
@@ -126,16 +135,21 @@ actor H264Encoder {
         let retryProperties = [
             kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!,
         ] as NSDictionary
-        guard let buffer = await encodeFrame(
+        let retry = await encodeFrame(
             source,
             session: fallbackSession,
             presentationTimeStamp: pts,
             frameProperties: retryProperties
-        ) else {
+        )
+        switch retry {
+        case let .sample(buffer):
+            forceKeyframeAfterReset = false
+            return try extract(from: buffer)
+        case .dropped:
+            return nil
+        case .failed:
             throw Errors.encodingFailed
         }
-        forceKeyframeAfterReset = false
-        return try extract(from: buffer)
     }
 
     private func encodeFrame(
@@ -143,12 +157,12 @@ actor H264Encoder {
         session: VTCompressionSession,
         presentationTimeStamp: CMTime,
         frameProperties: NSDictionary?
-    ) async -> CMSampleBuffer? {
+    ) async -> EncodeResult {
         await withCheckedContinuation { continuation in
             let completion = EncodeCompletion(continuation)
             let timeout = DispatchWorkItem {
                 streamDiagnosticLog("[stream:h264] encode timed out")
-                completion.resume(returning: nil)
+                completion.resume(returning: .failed)
             }
             completion.setTimeout(timeout)
             DispatchQueue.global(qos: .userInteractive).asyncAfter(
@@ -162,15 +176,19 @@ actor H264Encoder {
                 duration: .invalid,
                 frameProperties: frameProperties,
                 infoFlagsOut: nil
-            ) { @Sendable status, _, sampleBuffer in
-                guard status == noErr, let sb = sampleBuffer else {
-                    completion.resume(returning: nil)
-                    return
+            ) { @Sendable status, flags, sampleBuffer in
+                if status != noErr {
+                    completion.resume(returning: .failed)
+                } else if flags.contains(.frameDropped) {
+                    completion.resume(returning: .dropped)
+                } else if let sampleBuffer {
+                    completion.resume(returning: .sample(sampleBuffer))
+                } else {
+                    completion.resume(returning: .failed)
                 }
-                completion.resume(returning: sb)
             }
             if status != noErr {
-                completion.resume(returning: nil)
+                completion.resume(returning: .failed)
             }
         }
     }
@@ -389,12 +407,18 @@ actor H264Encoder {
     }
 }
 
+private enum EncodeResult {
+    case sample(CMSampleBuffer)
+    case dropped
+    case failed
+}
+
 private final class EncodeCompletion: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<CMSampleBuffer?, Never>?
+    private var continuation: CheckedContinuation<EncodeResult, Never>?
     private var timeout: DispatchWorkItem?
 
-    init(_ continuation: CheckedContinuation<CMSampleBuffer?, Never>) {
+    init(_ continuation: CheckedContinuation<EncodeResult, Never>) {
         self.continuation = continuation
     }
 
@@ -404,7 +428,7 @@ private final class EncodeCompletion: @unchecked Sendable {
         lock.unlock()
     }
 
-    func resume(returning sampleBuffer: CMSampleBuffer?) {
+    func resume(returning result: EncodeResult) {
         lock.lock()
         let continuation = self.continuation
         self.continuation = nil
@@ -412,6 +436,6 @@ private final class EncodeCompletion: @unchecked Sendable {
         self.timeout = nil
         lock.unlock()
         timeout?.cancel()
-        continuation?.resume(returning: sampleBuffer)
+        continuation?.resume(returning: result)
     }
 }

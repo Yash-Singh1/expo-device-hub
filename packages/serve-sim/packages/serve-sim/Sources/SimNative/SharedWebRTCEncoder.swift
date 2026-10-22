@@ -161,7 +161,7 @@ private final class SharedWebRTCEncoder: @unchecked Sendable {
         self.fps = fps
         encoder = H264Encoder(fps: fps, bitrate: bitrate,
                               constrainedBaseline: true, dynamicBitrate: true,
-                              lowLatencyRateControl: lowLatencyRateControl)
+                              lowLatencyRateControl: lowLatencyRateControl, fallbackOnFrameDrop: true)
         let encoder = self.encoder
         self.encodeFrame = encodeFrame ?? { buffer, forceIDR, bitrate, fps in
             await encoder.update(fps: fps, bitrate: bitrate)
