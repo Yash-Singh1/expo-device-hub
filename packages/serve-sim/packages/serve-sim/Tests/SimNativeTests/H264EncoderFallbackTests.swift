@@ -65,35 +65,41 @@ final class H264EncoderFallbackTests: XCTestCase {
 
     /// A successful VideoToolbox frame drop must not permanently change rate-control mode.
     func testDroppedFrameKeepsLowLatencySession() async throws {
+        try await checkDroppedFrameKeepsLowLatencySession(constrainedBaseline: false)
+    }
+
+    func testDroppedFrameKeepsLowLatencyConstrainedBaselineSession() async throws {
+        try await checkDroppedFrameKeepsLowLatencySession(constrainedBaseline: true)
+    }
+
+    private func checkDroppedFrameKeepsLowLatencySession(constrainedBaseline: Bool) async throws {
         try requireLowLatencyRateControl()
-        for constrainedBaseline in [false, true] {
-            let encoder = H264Encoder(fps: 60, bitrate: 500_000, constrainedBaseline: constrainedBaseline)
-            let flat = try frame()
-            var descriptions = 0
-            var delivered = 0
-            for _ in 0..<12 {
-                if let output = try await encoder.encode(flat) {
-                    delivered += 1
-                    if output.description != nil { descriptions += 1 }
-                }
+        let encoder = H264Encoder(fps: 60, bitrate: 500_000, constrainedBaseline: constrainedBaseline)
+        let flat = try frame()
+        var descriptions = 0
+        var delivered = 0
+        for _ in 0..<12 {
+            if let output = try await encoder.encode(flat) {
+                delivered += 1
+                if output.description != nil { descriptions += 1 }
             }
-            let initialFallbacks = await encoder.lowLatencyFallbacks
-            if delivered == 12 && initialFallbacks == 0 {
-                await encoder.stop()
-                throw XCTSkip("VideoToolbox did not drop a frame for constrainedBaseline=\(constrainedBaseline)")
-            }
-            XCTAssertLessThan(delivered, 12, "the regression requires a successful frame drop")
-            XCTAssertGreaterThan(delivered, 1, "the encoder must continue producing frames after a drop")
-            XCTAssertEqual(descriptions, 1, "a dropped frame must not replace the decoder configuration")
-            await encoder.update(fps: 30, bitrate: 500_000)
-            let reset = try await encoder.encode(flat)
-            XCTAssertNotNil(reset?.description)
-            await encoder.stop()
-            let reconnected = try await encoder.encode(flat)
-            XCTAssertNotNil(reconnected?.description)
-            let fallbacks = await encoder.lowLatencyFallbacks
-            XCTAssertEqual(fallbacks, 0)
-            await encoder.stop()
         }
+        let initialFallbacks = await encoder.lowLatencyFallbacks
+        if delivered == 12 && initialFallbacks == 0 {
+            await encoder.stop()
+            throw XCTSkip("VideoToolbox did not drop a frame for constrainedBaseline=\(constrainedBaseline)")
+        }
+        XCTAssertLessThan(delivered, 12, "the regression requires a successful frame drop")
+        XCTAssertGreaterThan(delivered, 1, "the encoder must continue producing frames after a drop")
+        XCTAssertEqual(descriptions, 1, "a dropped frame must not replace the decoder configuration")
+        await encoder.update(fps: 30, bitrate: 500_000)
+        let reset = try await encoder.encode(flat)
+        XCTAssertNotNil(reset?.description)
+        await encoder.stop()
+        let reconnected = try await encoder.encode(flat)
+        XCTAssertNotNil(reconnected?.description)
+        let fallbacks = await encoder.lowLatencyFallbacks
+        XCTAssertEqual(fallbacks, 0)
+        await encoder.stop()
     }
 }
