@@ -1,3 +1,4 @@
+import { timeStartup } from "./startup-timing";
 import { rm, stat } from "fs/promises";
 import { join } from "path";
 import { z } from "zod";
@@ -7,6 +8,7 @@ import { CAPTURE_FIELDS } from "./capture/fields";
 
 import {
   type HostActionResult,
+  HostActionTimeoutError,
   type Invocation,
   installAppInvocation,
   ok,
@@ -14,7 +16,12 @@ import {
   redactHostPaths,
 } from "./host-actions-utils";
 import { Argument, ConfinedPath, DESKTOP_DIR, SCREENSHOT_DIR } from "./host-paths";
-import { ScreenshotName, captureScreenshotAsync, newScreenshotName } from "./screenshot-store";
+import {
+  ScreenshotDisplay,
+  ScreenshotName,
+  captureScreenshotAsync,
+  newScreenshotName,
+} from "./screenshot-store";
 import { approveUrlScheme, launchApp, openUrlInApp, stopApp } from "./launch-manager";
 import { CA_DEBUG_FLAGS } from "./ca-debug";
 import { HINGE_POSITIONS, isHingeAngle } from "./hinge-angle";
@@ -408,8 +415,15 @@ const ACTION_SCHEMAS = {
     .object({ path: ConfinedPath })
     .meta({ description: "Download a file from the simulator host.", output: "base64" }),
   "screenshot.capture": z
-    .object({ udid: Device, fileName: ScreenshotName.optional() })
-    .meta({ description: "Take a screenshot.", output: "path" }),
+    .object({
+      udid: Device,
+      fileName: ScreenshotName.optional(),
+      display: ScreenshotDisplay.optional(),
+    })
+    .meta({
+      description: "Take a screenshot of the active display, or the specified simctl display ID.",
+      output: "path",
+    }),
   "screenshot.thumbnail": z.object({ fileName: ScreenshotName }).meta({ hidden: true }),
   "upload.append": z
     .object({
@@ -473,7 +487,7 @@ const PROCEDURE_ACTIONS = [
 ] as const satisfies readonly HostActionName[];
 
 type ProcedureAction = (typeof PROCEDURE_ACTIONS)[number];
-type InvocationAction = Exclude<HostActionName, ProcedureAction>;
+type InvocationAction = Exclude<HostActionName, ProcedureAction | "app.install">;
 
 function isProcedureAction(action: HostActionName): action is ProcedureAction {
   return PROCEDURE_ACTIONS.some((procedure) => procedure === action);
@@ -708,10 +722,6 @@ function buildInvocation(action: InvocationAction, raw: unknown, binPath: string
       const p = parseParams(action, raw);
       return { file: "plutil", args: ["-convert", "json", "-o", "-", p.path] };
     }
-    case "app.install": {
-      const p = parseParams(action, raw);
-      return installAppInvocation(p.udid, fileSourcePath(p));
-    }
     case "media.add": {
       const p = parseParams(action, raw);
       return simctl(["addmedia", p.udid, fileSourcePath(p)]);
@@ -740,6 +750,7 @@ async function runProcedureAsync(
   action: ProcedureAction,
   raw: unknown,
   streamSettings?: StreamSettings,
+  deviceName?: (udid: string) => string | undefined,
 ): Promise<HostActionResult> {
   switch (action) {
     case "clipboard.read":
@@ -799,16 +810,23 @@ async function runProcedureAsync(
     }
     case "app.launch": {
       const { udid, bundleId, launchArgs, openUrl } = parseParams(action, raw);
-      try {
-        await launchApp(udid, { bundleId, launchArgs, restart: true, openUrl });
-        return ok();
-      } catch (error) {
-        return {
-          stdout: "",
-          stderr: redactHostPaths(error instanceof Error ? error.message : String(error)),
-          exitCode: 1,
-        };
-      }
+      return timeStartup(
+        action,
+        async () => {
+          try {
+            await launchApp(udid, { bundleId, launchArgs, restart: true, openUrl });
+            return ok();
+          } catch (error) {
+            return {
+              stdout: "",
+              stderr: redactHostPaths(error instanceof Error ? error.message : String(error)),
+              exitCode: 1,
+            };
+          }
+        },
+        udid,
+        { deviceName: deviceName?.(udid), isSuccessful: (result) => result.exitCode === 0 },
+      );
     }
     case "upload.append": {
       const p = parseParams(action, raw);
@@ -902,10 +920,63 @@ async function runProcedureAsync(
     }
     case "screenshot.capture": {
       const p = parseParams(action, raw);
-      return await captureScreenshotAsync({
-        udid: p.udid,
-        fileName: p.fileName ?? newScreenshotName(),
-      });
+      let failure = "Could not resolve that simulator. Specify a booted simulator UDID.";
+      try {
+        const { resolveBootedDeviceAsync } = await import("./device");
+        const { getScreenshotDisplayIdsAsync } = await import("./screenshot-display");
+        p.udid = await resolveBootedDeviceAsync(p.udid);
+        const capture = (display: number, read?: () => Promise<number>) =>
+          captureScreenshotAsync(
+            { udid: p.udid, fileName: p.fileName ?? newScreenshotName(), display },
+            read,
+          );
+        failure = "Could not capture the screenshot. Check the host logs for details.";
+        if (p.display !== undefined) {
+          const ids = await getScreenshotDisplayIdsAsync(p.udid);
+          if (ids && !ids.includes(p.display))
+            return {
+              stdout: "",
+              exitCode: 1,
+              stderr: `Display ${p.display} is not a device screen on this simulator. Choose ${ids.join(" or ")}.`,
+            };
+          return await capture(p.display);
+        }
+        const { withScreenshotDeviceSession } = await import("./device-session");
+        failure =
+          "Could not start screenshot capture. Check that the simulator is booted and check the host logs.";
+        let selected = false;
+        try {
+          return await withScreenshotDeviceSession(p.udid, streamSettings, async (session) => {
+            const read = async () => {
+              failure =
+                "Could not determine the active display. Check that the simulator is booted, then retry or specify a display ID.";
+              const display = await session.activeScreenId();
+              failure = "Could not capture the screenshot. Check the host logs for details.";
+              return display;
+            };
+            const display = await read();
+            selected = true;
+            return await capture(display, read);
+          });
+        } catch (error) {
+          // @ref LLP 0003#action-catalog — only a proven sole screen can bypass native election
+          const ids = !selected ? await getScreenshotDisplayIdsAsync(p.udid) : null;
+          if (ids?.length !== 1) throw error;
+          console.error(
+            "Native screenshot selection unavailable; using the sole device screen:",
+            error,
+          );
+          failure = "Could not capture the screenshot. Check the host logs for details.";
+          return await capture(ids[0]!);
+        }
+      } catch (error) {
+        console.error("Screenshot capture failed:", error);
+        return {
+          stdout: "",
+          stderr: error instanceof HostActionTimeoutError ? error.message : failure,
+          exitCode: 1,
+        };
+      }
     }
     case "actions.describe":
       parseParams(action, raw);
@@ -935,14 +1006,26 @@ export async function runHostActionAsync(
   msg: HostActionRequest,
   binPath: string,
   streamSettings?: StreamSettings,
+  deviceName?: (udid: string) => string | undefined,
 ): Promise<HostActionResult> {
   const { action, params } = msg;
   if (typeof action !== "string" || !isHostActionName(action)) {
     throw new InvalidHostActionError(`unknown action ${String(action)}`);
   }
-  const result = isProcedureAction(action)
-    ? await runProcedureAsync(action, params, streamSettings)
-    : await runInvocation(buildInvocation(action, params, binPath));
+  let result: HostActionResult;
+  if (action === "app.install") {
+    const p = parseParams(action, params);
+    result = await timeStartup(
+      action,
+      () => runInvocation(installAppInvocation(p.udid, fileSourcePath(p))),
+      p.udid,
+      { deviceName: deviceName?.(p.udid), isSuccessful: (value) => value.exitCode === 0 },
+    );
+  } else {
+    result = await (isProcedureAction(action)
+      ? runProcedureAsync(action, params, streamSettings, deviceName)
+      : runInvocation(buildInvocation(action, params, binPath)));
+  }
   // exec-ws spreads this straight into the reply, so only the three fields the page reads leave
   // the process. `timedOut` steers the message a handler composes; the page has no use for it.
   const { stdout, stderr, exitCode } = result;

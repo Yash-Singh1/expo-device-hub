@@ -1,3 +1,10 @@
+import { getScreenshotDisplayIdsAsync } from "./screenshot-display";
+import {
+  captureScreenshotFileAsync,
+  ScreenshotDisplay,
+  SCREENSHOT_DISPLAY_CHANGED,
+} from "./screenshot-store";
+import { createReadinessReporter } from "./startup-timing";
 import { openSseStream } from "./sse-stream";
 import { parseCaptureProxy } from "./capture/upstream";
 import { execFile, execSync } from "child_process";
@@ -46,7 +53,14 @@ import {
   type ForegroundTrackerCache,
 } from "./foreground-tracker";
 import { corsAllowOriginHeaders, frameAncestorsPolicy, isAllowedOrigin } from "./middleware-utils";
-import { closeDeviceSession, getDeviceSession, peekDeviceSession } from "./device-session";
+import {
+  closeDeviceSession,
+  getDeviceSession,
+  withScreenshotDeviceSession,
+  peekDeviceSession,
+  retainDeviceSession,
+  withDeviceSessionTask,
+} from "./device-session";
 import {
   assertBearerAccess,
   assertCaptureAccess,
@@ -766,8 +780,29 @@ function serveHelperInProcess(
     void live.handlePanel(req, res, Number(panelRoute[1]), panelRoute[2]!);
     return true;
   }
+  // Unknown and one-shot helper reads must not claim screenshot-owned capture.
+  if (
+    !panelRoute &&
+    ![
+      "/stream.mjpeg",
+      "/stream.avcc",
+      "/stream-settings",
+      "/config",
+      "/health",
+      "/webrtc/offer",
+      "/webrtc/close",
+      "/recording/video",
+      "/ax",
+      "/foreground",
+    ].includes(endpoint ?? "")
+  )
+    return false;
+  const retainsCapture =
+    Boolean(panelRoute) ||
+    ((endpoint === "/stream.mjpeg" || endpoint === "/stream.avcc") && req.method === "GET") ||
+    ((endpoint === "/webrtc/offer" || endpoint === "/recording/video") && req.method === "POST");
   try {
-    session = getDeviceSession(device, initialStreamSettings);
+    session = getDeviceSession(device, initialStreamSettings, retainsCapture);
   } catch {
     return false; // not booted / capture unavailable → 404
   }
@@ -783,7 +818,9 @@ function serveHelperInProcess(
       session.handleAvcc(req, res);
       return true;
     case "/stream-settings":
-      void session.handleStreamSettings(req, res);
+      void withDeviceSessionTask(session, async () => {
+        if (await session.handleStreamSettings(req, res)) retainDeviceSession(session);
+      });
       return true;
     case "/config":
       session.handleConfig(req, res);
@@ -1951,6 +1988,7 @@ export async function handleCaptureEntriesRequest(
 }
 
 export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
+  const reportReadiness = createReadinessReporter();
   validatedAdditionalDylibs();
   const streamSettings =
     options?.streamSettings ?? httpStreamSettingsFromLegacyCodec(options?.codec);
@@ -2654,6 +2692,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       const states = await readServeSimStates();
       const state = selectServeSimState(states, selectedDevice);
       if (!state) {
+        reportReadiness("unavailable", "session-unavailable", selectedDevice ?? undefined);
         res.writeHead(503, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
@@ -2663,12 +2702,20 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       }
       try {
         await getDeviceSession(state.device, streamSettings).start();
+        reportReadiness("ready", undefined, state.device, undefined, selectedDevice ?? null);
         res.writeHead(200, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
         });
         res.end(JSON.stringify({ status: "ready", device: state.device }));
-      } catch {
+      } catch (error) {
+        reportReadiness(
+          "unavailable",
+          "capture-start-failed",
+          state.device,
+          error,
+          selectedDevice ?? null,
+        );
         res.writeHead(503, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
@@ -2765,21 +2812,36 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         res.end(JSON.stringify({ ok: false, error: "No booted simulator to screenshot" }));
         return;
       }
-      // simctl only writes to a file, so round-trip through a private tmp path
-      // instead of streaming; captures are a few MB at most.
+      const displayValue = new URL(rawUrl, "http://localhost").searchParams.get("display");
+      const display =
+        displayValue === null ? undefined : ScreenshotDisplay.safeParse(Number(displayValue));
+      if (display && !display.success) {
+        res.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Invalid simulator display ID" }));
+        return;
+      }
+      udid = udid.toUpperCase();
+      // HTTP downloads avoid staging and Desktop copies, but share panel election.
       const file = join(tmpdir(), `serve-sim-screenshot-${randomBytes(8).toString("hex")}.png`);
       try {
-        await new Promise<void>((resolve, reject) => {
-          execFile(
-            "xcrun",
-            ["simctl", "io", udid, "screenshot", file],
-            { timeout: 5_000 },
-            (err, _stdout, stderr) => {
-              if (err) reject(Object.assign(err, { stderr: stderr?.toString() }));
-              else resolve();
-            },
-          );
-        });
+        const screenId = display?.data;
+        const capture = (id: number, read?: () => Promise<number>) =>
+          captureScreenshotFileAsync({ udid, file, display: id, timeoutMs: 5_000 }, read);
+        const result =
+          screenId !== undefined
+            ? await capture(screenId)
+            : await withScreenshotDeviceSession(udid, streamSettings, async (session) => {
+                const read = () => session.activeScreenId();
+                return await capture(await read(), read);
+              }).catch(async (error) => {
+                // A sole integrated display needs no native panel election. Never
+                // fall back on an unknown profile or a multi-display device.
+                if (!(await getBootedUdids())?.has(udid)) throw error;
+                const ids = await getScreenshotDisplayIdsAsync(udid);
+                if (ids?.length !== 1) throw error;
+                return await capture(ids[0]!);
+              });
+        if (result.exitCode !== 0) throw new Error(result.stderr || "simctl screenshot failed");
         const png = await readFile(file);
         const artifact = await saveScreenshotArtifact(png);
         recordScreenshotEvent(udid, artifact);
@@ -2806,7 +2868,15 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           "Cache-Control": "no-store",
           "Content-Type": "application/json",
         });
-        res.end(JSON.stringify({ ok: false, error: message }));
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error:
+              message === SCREENSHOT_DISPLAY_CHANGED
+                ? SCREENSHOT_DISPLAY_CHANGED
+                : "Simulator screenshot failed",
+          }),
+        );
       } finally {
         // Best-effort cleanup; the PNG is already in memory by now.
         await unlink(file).catch(() => {});
@@ -3346,6 +3416,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     ssePrefixes: sseStreamPaths(base),
     onUiRequest: handleUiRequest,
     serveSimBinPath: serveSimBinPath(),
+    deviceName: bootedDeviceName,
     onActionResult: (action, params, result) => recordActionEvent(action, params, result),
     onSseRequest(path, websocketRequest) {
       const url = new URL(path, websocketRequest.url);

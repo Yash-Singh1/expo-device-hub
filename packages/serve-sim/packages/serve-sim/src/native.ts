@@ -25,7 +25,7 @@ interface SimHIDHandle {
   setScreen(screenId: number): Promise<boolean | void>;
   supportsHingeAngle(): Promise<boolean>;
   hingeState(): Promise<NativeHingeState>;
-  hingeControlEligibility(): Promise<NativeHingeState>;
+  hingeControlEligibility(): Promise<NativeHingeReadback>;
   setHingeAngle(angle: number): Promise<boolean>;
   setHingePose(pose: string): Promise<boolean>;
   supportsPhysicalOrientation(): Promise<boolean>;
@@ -77,6 +77,7 @@ interface SimCaptureHandle {
   closeWebRTCSession(sessionId: string): Promise<void>;
   webRTCSenderStats(sessionId: string): Promise<string>;
   screenSize(): Promise<NativeScreenInfo>;
+  activeScreenId(): Promise<number>;
   subscribeScreenChanges(onChange: () => Promise<void>): Promise<NativeUnsubscribe>;
   subscribeDeviceState(onSnapshot: (json: string) => Promise<void>): Promise<NativeUnsubscribe>;
   stop(): Promise<void>;
@@ -135,6 +136,9 @@ export type NativeHingeState = {
   tableMode?: boolean;
   physicalOrientation?: HingePhysicalOrientation;
 };
+
+/** Command reconciliation never synthesizes native tabletop activity. */
+export type NativeHingeReadback = NativeHingeState & { tableModeActive?: boolean };
 
 export type NativeDeviceStateSnapshot = {
   generation: number;
@@ -289,13 +293,14 @@ export class NativeHid {
     return this.guard("hingeState", () => this.handle.hingeState(), {});
   }
 
-  async hingeControlEligibility(): Promise<NativeHingeState> {
+  async hingeControlEligibility(): Promise<NativeHingeReadback | null> {
+    // An empty sample has unknown fields; null means the read failed.
     return (
-      (await this.guard(
+      (await this.guard<NativeHingeReadback | null>(
         "hingeControlEligibility",
         () => this.handle.hingeControlEligibility(),
-        {},
-      )) ?? {}
+        null,
+      )) ?? null
     );
   }
 
@@ -482,6 +487,10 @@ export class NativeCapture {
 
   screenSize(): Promise<NativeScreenInfo> {
     return this.handle.screenSize();
+  }
+
+  activeScreenId(): Promise<number> {
+    return this.handle.activeScreenId();
   }
 
   async subscribeDeviceState(

@@ -5,7 +5,7 @@
 **Systems:** ServeSim, HubClient
 **Author:** Gabe Debes
 **Date:** 2026-09-23
-**Revised:** 2026-10-15 (rotation readback and app actions; clipboard; server-wide preview sharing; capture reboot status and recording admission; device-state recording manifest; settings and device actions; action catalog)
+**Revised:** 2026-10-17 (rotation readback and app actions; clipboard; server-wide preview sharing; capture reboot status and recording admission; device-state recording manifest; settings and device actions; action catalog; active-display screenshots and observed hinge readback)
 **Related:** LLP 0001, LLP 0002
 
 > File paths such as `src/…` are relative to `packages/serve-sim/packages/serve-sim`, unless the text gives a path from the repository root.
@@ -23,7 +23,7 @@ server's selected device.
 | `/healthz`, `/readyz`                                                                               | Liveness and readiness. These remain reachable without a token when `--require-token` is set. `/readyz` answers 503 while a device is still starting.                                                                                                                                                 |
 | `/`                                                                                                 | The preview page.                                                                                                                                                                                                                                                                                     |
 | `/api`                                                                                              | Current device and stream state, including `execToken`.                                                                                                                                                                                                                                               |
-| `/api/screenshot`                                                                                   | `POST`. A still PNG.                                                                                                                                                                                                                                                                                  |
+| `/api/screenshot`                                                                                   | `POST`. A still PNG from the active display, or `?display=<screen ID>`.                                                                                                                                                                                                                               |
 | `/api/apps/icon?bundleId=<id>`                                                                      | An installed app's icon, `{ok, bundleId, icon: {mimeType, data} \| null}`, the same shape as serve-emu's route, with `bundleId` in place of `packageName`. `icon` is null when the app has its icon only in `Assets.car`. 404 when the app is not installed, 503 when `simctl` cannot answer (retry). |
 | `/api/pasteboard`                                                                                   | `POST` reads the simulator pasteboard as `{ok, text}`; `?copy=1` presses Command+C first; `PUT` with `{"text": …}` writes it. See [Pasteboard](#pasteboard).                                                                                                                                          |
 | `/helper/<udid>/recording/video`                                                                    | `GET` reports whether a recording is active; `POST` starts, `PUT` renews, and `DELETE` finalizes a native-size H.264 recording. Mutations require a recording ID; when `--require-token` is set, they also require its bearer token.                                                                  |
@@ -481,7 +481,13 @@ plus `increment` and `decrement` for `textSize`; aliases are refused. `settings.
 - `memoryWarning`: `{udid}`. Sends a memory warning to the device.
 - `caDebug.set`: `{udid, option, value}`. `option` is a name from `src/ca-debug.ts`;
   `value` is `on` or `off`.
-- `hinge.get`: `{udid}`. Reads the hinge state as JSON.
+- `hinge.get`: `{udid}`. Reads hinge state as JSON. New helpers advertise
+  `supportsHingeStateReadback` and answer binary request `0x13` with `0x93`:
+  `{ok, state?, error?}`. The read takes its turn in the hinge queue and uses
+  native eligibility, which reconciles acknowledged controls with newer source
+  samples. `tableMode` remains the acknowledged persistent setting;
+  `tableModeActive` reports native tabletop activity separately. Older helpers
+  retain their config-based fallback. Unknown native pose fields stay unknown.
 - `hinge.set`: `{udid, value}`. `value` is `fold`, `half`, `unfold` or an angle from
   0 to 180.
 - `permissions.list`: `{udid, bundleId?}`. Returns the app permissions as JSON.
@@ -551,4 +557,61 @@ The catalog leaves out actions with `hidden: true`: `server.*`, `reveal`,
 `screenshot.thumbnail`, `upload.*` and `actions.describe`. They still run when
 called.
 
-`screenshot.capture` makes a file name when `fileName` is missing.
+`screenshot.capture` takes `{udid, fileName?, display?}` and makes a file name
+when `fileName` is missing. `display` is a positive simctl screen ID. Known non-integrated ports are rejected
+before capture unless the profile declares exactly one screen, as on tvOS; an
+unknown profile leaves explicit selection available. A client
+can capture a particular panel even when it is inactive. Without it, the action
+borrows an existing device session or creates a temporary capture with the
+middleware's trusted settings, then selects the native active display. Temporary
+capture is closed after success or failure; existing streams remain open. If that display cannot be determined,
+the action uses the sole declared screen, or the sole integrated panel when
+other output ports are present, only when the installed device-type capability
+profile proves that selection is unambiguous. Multi-panel and unknown profiles
+fail with a retry message. Legacy iOS profiles that declare only
+`ScreenDimensionsCapability` require a recognized phone/pad idiom and a fresh
+`simctl io enumerate` result: every framebuffer port must have a known class,
+exactly one must be integrated, and its default dimensions must match the
+profile's main screen (allowing rotation). Its display adapter must also list
+exactly one integrated connected screen with matching dimensions and a valid
+numeric ID. Both fallback capture and explicit-ID validation use that ID. A present but malformed `displays` array cannot use
+this legacy path. Public `display` parameters remain numeric. [observed:
+`getScreenshotDisplayIdsAsync`]
+
+Native error details stay in the host logs, rather
+than reaching the client. An inactive
+panel's screenshot may be black.
+
+Captures write to a separate temporary file and publish it to the staged name
+only after active-display validation succeeds. Publication and empty-reservation
+cleanup share the reservation queue so a failed capture cannot delete a
+concurrent successful publication. Failed captures remove their
+temporary pixels and empty reservations, preserving an existing successful
+screenshot of the same name. [observed: `captureScreenshotAsync`]
+
+Native screenshot startup and active-display reads use the configured host-action
+deadline. A timed-out one-shot releases its temporary session and stops native
+startup without waiting for the hung start promise; late continuations cannot
+restart it. Retained viewer sessions stay open. Teardown keeps pending recording promises
+until their results are observed, preserving finalization errors. UDID case aliases share the same
+registry entry. Screenshot profile lookup resolves the selected bundle from
+simctl and reads its capability plist asynchronously, without scanning installed
+bundles on the event loop. [observed: `withScreenshotDeviceSession`,
+`DeviceSession.start`, `DeviceSession.close`, `getScreenshotDisplayIdsAsync`]
+
+The HTTP `/api/screenshot` download follows the same native active-display
+selection and three-attempt handoff bound as `screenshot.capture`. Its optional
+`display` query selects an explicit panel without starting native capture. It
+keeps the existing PNG response, artifact headers, and temporary-file cleanup,
+without the host action's Desktop copy. Default HTTP captures share the same
+one-shot session ownership. If native startup or display readback fails, an
+installed device profile confirming exactly one display permits a
+`simctl screenshot` fallback with that display ID. Unknown profiles and multi-display devices still
+require native panel election. [observed: `simMiddleware` screenshot route,
+`getScreenshotDisplayIdsAsync`]
+
+Capture errors return a generic message, except for the safe retry guidance
+when the active display keeps changing. Private native-startup and simctl
+diagnostics stay in host logs. The `display` query uses CoreSimulator IDs;
+serve-emu's screenshot route has no equivalent query and retains its existing
+device screenshot behavior. [observed: serve-sim and serve-emu `middleware.ts`]

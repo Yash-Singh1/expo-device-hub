@@ -1,3 +1,5 @@
+import { withHostActionDeadline } from "./host-actions-utils";
+import { timeStartup } from "./startup-timing";
 import { RECORDING_LEASE_MS } from "./recording-timeouts";
 import { US_KEYBOARD_MAP } from "./text-to-keys";
 /**
@@ -55,6 +57,7 @@ import { readSavedHingeState, writeSavedHingeState } from "./hinge-saved-state";
 import { validatePanelRoute } from "./panel-route";
 import {
   isHingeControlCommand,
+  observedHingeState,
   hingeControlState,
   hingePoseOrientation,
   isTableModeAvailable,
@@ -133,6 +136,7 @@ const TOUCH_TAP_MAX_DISTANCE = 0.004;
 const MAX_HID_SOCKETS = 8;
 const MAX_PENDING_INPUT_OPERATIONS_PER_SOCKET = 1024;
 const INVALID_RECORDING_ID_CHAR = /[^A-Za-z0-9_-]/;
+const RECORDING_CANCELLATION_MS = 120_000;
 
 class RecordingStartCancelled extends Error {}
 class RecordingStartRebooting extends RecordingStartCancelled {}
@@ -302,6 +306,7 @@ export class DeviceSession {
   private inputGeneration = 0;
   private rebootSuspended = false;
   private captureStart?: Promise<void>;
+  private captureReady = false;
   private phase: "unstarted" | "running" | "stopped" = "unstarted";
 
   private width = 0;
@@ -362,7 +367,6 @@ export class DeviceSession {
   private recordingFinishingId?: string;
   private lastFinishedRecording?: { id: string; manifest: string };
   private lastFailedRecording?: { id: string; error: Error };
-  private readonly cancelledBeforeStart = new Map<string, number>();
   private recordingFailure?: Error;
   private inputQueueDraining = false;
   private scrollOwner?: HidSocket;
@@ -394,14 +398,29 @@ export class DeviceSession {
     this.activeHidKeyUsages.set(this.serverInput, new Set());
   }
 
+  /** Use the same native panel election as the live stream, including external folds. */
+  async activeScreenId(): Promise<number> {
+    await withHostActionDeadline(this.start(), "Screenshot capture startup");
+    return await withHostActionDeadline(this.capture.activeScreenId(), "Active display read");
+  }
+
   /** Begin capture. Throws if the device isn't booted. Idempotent. */
   start(): Promise<void> {
     if (this.phase === "running") return this.captureStart ?? Promise.resolve();
     if (this.phase === "stopped") return Promise.reject(new Error("Capture session is stopped"));
     this.phase = "running";
-    this.captureStart = refreshDeviceOptionState(this.udid)
-      .then(() => this.capture.start())
+    this.captureStart = timeStartup(
+      "device-options",
+      () => refreshDeviceOptionState(this.udid),
+      this.udid,
+    )
       .then(async () => {
+        if (this.phase === "running") {
+          await timeStartup("native-capture", () => this.capture.start(), this.udid);
+        }
+      })
+      .then(async () => {
+        if (this.phase !== "running") return;
         const unsubscribe = await this.capture.subscribeScreenChanges(async () => {
           if (this.phase !== "running") return;
           try {
@@ -429,11 +448,20 @@ export class DeviceSession {
           .catch((error) => {
             console.error(`[capture] Device state observation unavailable: ${error}`);
           });
-        if (await this.refreshScreenSizeFromNative()) this.broadcastConfig();
+        if (
+          await timeStartup(
+            "screen-configuration",
+            () => this.refreshScreenSizeFromNative(),
+            this.udid,
+          )
+        )
+          this.broadcastConfig();
+        if (this.phase !== "running") return;
         this.scheduleScreenRefresh();
         // Discover fold controls without delaying the first frame or inventing
         // an initial angle when CoreDevice has not reported one.
         void this.discoverHingeCapabilities().catch(() => {});
+        this.captureReady = true;
       });
     return this.captureStart;
   }
@@ -486,6 +514,12 @@ export class DeviceSession {
   close(): void {
     if (this.phase !== "running") return;
     this.phase = "stopped";
+    // Keep the promises even if their completion clears the mutable fields
+    // while observer teardown is pending; finalization failures still belong to this close.
+    const recordingStart = this.recordingStart;
+    const recordingFinishing = this.recordingFinishing;
+    const stopPendingStartup =
+      !this.captureReady && !recordingStart && !recordingFinishing && !this.recordingLease;
     this.clearSoftwareKeyboardRequests();
     if (this.recordingLease) clearTimeout(this.recordingLease.timer);
     this.recordingLease = undefined;
@@ -504,23 +538,31 @@ export class DeviceSession {
     }
     for (const res of this.panelRequests) res.destroy();
     for (const panel of this.panels.values()) this.stopPanel(panel);
+    // A screenshot may time out while native startup is suspended. Stop it now;
+    // waiting for captureStart would keep that temporary capture alive indefinitely.
+    const stoppingStartup = stopPendingStartup
+      ? Promise.resolve().then(() => this.capture.stop())
+      : undefined;
+    // Observe a stop failure immediately while observer cleanup is still pending;
+    // the tracked finalization below reports it after that cleanup.
+    void stoppingStartup?.catch(() => {});
     trackClosedSessionStop(
       (async () => {
-        await this.captureStart?.catch(() => {});
+        if (!stoppingStartup) await this.captureStart?.catch(() => {});
         await Promise.all([screenChangesDetached, deviceStateDetached]);
         let recordingError: unknown = this.recordingFailure;
         try {
-          await this.recordingStart;
+          await recordingStart;
         } catch (error) {
           if (!(error instanceof RecordingStartCancelled)) recordingError ??= error;
         }
         try {
-          await this.recordingFinishing;
+          await recordingFinishing;
         } catch (error) {
           recordingError ??= error;
         }
         try {
-          await this.capture.stop();
+          await (stoppingStartup ?? this.capture.stop());
         } catch (error) {
           recordingError ??= error;
         }
@@ -604,7 +646,9 @@ export class DeviceSession {
           });
           return;
         }
-        const cancelledUntil = this.cancelledBeforeStart.get(body.recordingId);
+        const cancelledUntil = recordingStartCancellations
+          .get(this.udid)
+          ?.ids.get(body.recordingId);
         if (cancelledUntil && cancelledUntil > Date.now()) {
           this.sendJson(res, 409, { error: "recording_start_cancelled" });
           return;
@@ -723,17 +767,23 @@ export class DeviceSession {
           recordingId !== this.recordingLease?.id
         ) {
           const now = Date.now();
-          for (const [id, until] of this.cancelledBeforeStart) {
-            if (until <= now) this.cancelledBeforeStart.delete(id);
+          const previous = recordingStartCancellations.get(this.udid);
+          const ids = previous?.ids ?? new Map<string, number>();
+          for (const [id, until] of ids) {
+            if (until <= now) ids.delete(id);
           }
-          if (
-            !this.cancelledBeforeStart.has(recordingId) &&
-            this.cancelledBeforeStart.size >= 512
-          ) {
+          if (!ids.has(recordingId) && ids.size >= 512) {
             this.sendJson(res, 503, { error: "recording_cancellation_limit" });
             return;
           }
-          this.cancelledBeforeStart.set(recordingId, now + 120_000);
+          ids.set(recordingId, now + RECORDING_CANCELLATION_MS);
+          if (previous) clearTimeout(previous.timer);
+          const timer = setTimeout(
+            () => recordingStartCancellations.delete(this.udid),
+            RECORDING_CANCELLATION_MS,
+          );
+          timer.unref();
+          recordingStartCancellations.set(this.udid, { ids, timer });
           this.sendJson(res, 202, { cancelled: true });
           return;
         }
@@ -1093,7 +1143,7 @@ export class DeviceSession {
     this.sendJson(res, 200, { status: "ok" });
   }
 
-  async handleStreamSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async handleStreamSettings(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     if (req.method === "GET") {
       await this.streamSettingsUpdate;
       if (!res.writableEnded && !res.destroyed) {
@@ -1103,15 +1153,15 @@ export class DeviceSession {
           streamEncoderSettingsForTransport(this.encoderSettings, this.transport),
         );
       }
-      return;
+      return false;
     }
     if (req.method !== "PATCH") {
       this.sendJson(res, 405, { error: "method_not_allowed" });
-      return;
+      return false;
     }
     if (!isJsonRequest(req)) {
       this.sendJson(res, 415, { error: "unsupported_media_type" });
-      return;
+      return false;
     }
 
     try {
@@ -1131,11 +1181,13 @@ export class DeviceSession {
       if (!res.writableEnded && !res.destroyed) {
         this.sendJson(res, 200, streamEncoderSettingsForTransport(settings, this.transport));
       }
+      return true;
     } catch (error) {
-      if (res.writableEnded || res.destroyed) return;
+      if (res.writableEnded || res.destroyed) return false;
       const status = error instanceof WebRtcSignalingError ? error.status : 500;
       const code = error instanceof WebRtcSignalingError ? error.code : "stream_settings_failed";
       this.sendJson(res, status, { error: code });
+      return false;
     }
   }
 
@@ -1756,6 +1808,61 @@ export class DeviceSession {
         }
         break;
       }
+      case 0x13: {
+        if (data.length !== 1) break;
+        const generation = this.inputGeneration;
+        const operation = this.hingeControlUpdate.then(async () => {
+          if (this.supportsHingeAngle !== true || !this.canRunInputControl(generation))
+            throw new Error("Hinge state is unavailable");
+          const observed = this.observedDeviceState;
+          const eligibility =
+            observed === undefined ? undefined : await this.hid.hingeControlEligibility();
+          if (eligibility === null) throw new Error("Hinge state is unavailable");
+          const state =
+            eligibility === undefined
+              ? {
+                  ...observedHingeState({
+                    hingeAngle: this.hingeAngle,
+                    physicalOrientation: this.hingePhysicalOrientation,
+                  }),
+                  hingePose: this.hingePose,
+                }
+              : observedHingeState(eligibility);
+          if (!this.canRunInputControl(generation)) throw new Error("Hinge state is unavailable");
+          ws.send(
+            Buffer.concat([
+              Buffer.from([0x93]),
+              Buffer.from(
+                JSON.stringify({
+                  ok: true,
+                  state: {
+                    ...state,
+                    tableMode: this.tableMode,
+                    ...(observed ? { tableModeActive: eligibility?.tableModeActive } : {}),
+                  },
+                }),
+              ),
+            ]),
+          );
+        });
+        this.hingeControlUpdate = operation.then(
+          () => {},
+          () => {},
+        );
+        try {
+          await operation;
+        } catch {
+          try {
+            ws.send(
+              Buffer.concat([
+                Buffer.from([0x93]),
+                Buffer.from('{"ok":false,"error":"Hinge state is unavailable"}'),
+              ]),
+            );
+          } catch {}
+        }
+        break;
+      }
       case 0x11: {
         const requestId =
           data.length === 1 ? undefined : json<{ requestId?: unknown }>()?.requestId;
@@ -1947,7 +2054,7 @@ export class DeviceSession {
       // @ref LLP 0004#live-pose-observation — eligibility orders native samples against successful sends
       const eligibility =
         needsPose && this.observedDeviceState !== undefined
-          ? await this.hid.hingeControlEligibility()
+          ? ((await this.hid.hingeControlEligibility()) ?? {})
           : { hingeAngle: this.hingeAngle, physicalOrientation: this.hingePhysicalOrientation };
       if (!this.canRunInputControl(generation)) return false;
       if (
@@ -2702,6 +2809,7 @@ export class DeviceSession {
     keyboardUnavailable: boolean;
     screenId?: number;
     supportsHingeAngle?: boolean;
+    supportsHingeStateReadback?: boolean;
     supportsPhysicalOrientation?: boolean;
     hingeAngle?: number;
     hingePose?: HingePose | null;
@@ -2723,7 +2831,10 @@ export class DeviceSession {
         ? { supportsPhysicalOrientation: this.supportsPhysicalOrientation }
         : {}),
       ...(this.supportsHingeAngle !== undefined
-        ? { supportsHingeAngle: this.supportsHingeAngle }
+        ? {
+            supportsHingeAngle: this.supportsHingeAngle,
+            supportsHingeStateReadback: this.supportsHingeAngle,
+          }
         : {}),
       ...(this.hingeAngle !== undefined ? { hingeAngle: this.hingeAngle } : {}),
       ...(this.supportsHingeAngle
@@ -2857,6 +2968,15 @@ export class DeviceSession {
 // ── Registry ─────────────────────────────────────────────────────────────
 
 const sessions = new Map<string, DeviceSession>();
+// Cancellation outlives capture, but expires without retaining a native session.
+const recordingStartCancellations = new Map<
+  string,
+  {
+    ids: Map<string, number>;
+    timer: ReturnType<typeof setTimeout>;
+  }
+>();
+const screenshotOwners = new Map<DeviceSession, { count: number; retained: boolean }>();
 const closedSessionStops = new Set<Promise<void>>();
 const closedSessionStopErrors: unknown[] = [];
 let recordingsShuttingDown = false;
@@ -2875,7 +2995,7 @@ function trackClosedSessionStop(stopping: Promise<void>): void {
 
 /** Existing session only. Reading stats must never be the thing that starts capture. */
 export function peekDeviceSession(udid: string): DeviceSession | undefined {
-  return sessions.get(udid);
+  return sessions.get(udid.toUpperCase());
 }
 
 /**
@@ -2885,8 +3005,13 @@ export function peekDeviceSession(udid: string): DeviceSession | undefined {
 export function getDeviceSession(
   udid: string,
   initialStreamSettings?: StreamSettings,
+  retainExisting = true,
 ): DeviceSession {
+  udid = udid.toUpperCase();
   let session = sessions.get(udid);
+  if (session) {
+    if (retainExisting) retainDeviceSession(session);
+  }
   if (!session) {
     const createdSession = new DeviceSession(udid, initialStreamSettings);
     session = createdSession;
@@ -2907,15 +3032,55 @@ export function getDeviceSession(
   return session;
 }
 
+/** Claim session state for a persistent consumer, such as an accepted settings update. */
+export function retainDeviceSession(session: DeviceSession): void {
+  const owner = screenshotOwners.get(session);
+  if (owner) owner.retained = true;
+}
+
+/** Prevent screenshot cleanup from closing a session while a finite helper task uses it. */
+export async function withDeviceSessionTask<T>(
+  session: DeviceSession,
+  work: () => Promise<T>,
+): Promise<T> {
+  const owner = screenshotOwners.get(session);
+  if (owner) owner.count++;
+  try {
+    return await work();
+  } finally {
+    if (owner && --owner.count === 0) {
+      screenshotOwners.delete(session);
+      if (!owner.retained && sessions.get(session.udid) === session)
+        closeDeviceSession(session.udid);
+    }
+  }
+}
+
+/** Share screenshot startup, releasing capture unless another consumer claims it. */
+export async function withScreenshotDeviceSession<T>(
+  udid: string,
+  settings: StreamSettings | undefined,
+  capture: (session: DeviceSession) => Promise<T>,
+): Promise<T> {
+  const existing = peekDeviceSession(udid);
+  const session = existing ?? getDeviceSession(udid, settings);
+  if (!existing) screenshotOwners.set(session, { count: 0, retained: false });
+  return await withDeviceSessionTask(session, async () => {
+    await withHostActionDeadline(session.start(), "Screenshot capture startup");
+    return await capture(session);
+  });
+}
+
 export async function suspendDeviceSessionForReboot(udid: string): Promise<void> {
-  await sessions.get(udid)?.suspendForReboot();
+  await peekDeviceSession(udid)?.suspendForReboot();
 }
 
 export async function resumeDeviceSessionAfterReboot(udid: string): Promise<void> {
-  await sessions.get(udid)?.resumeAfterReboot();
+  await peekDeviceSession(udid)?.resumeAfterReboot();
 }
 
 export function closeDeviceSession(udid: string): void {
+  udid = udid.toUpperCase();
   const session = sessions.get(udid);
   if (session) {
     session.close();

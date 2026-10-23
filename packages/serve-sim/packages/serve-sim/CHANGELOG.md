@@ -1,5 +1,19 @@
 # @expo/serve-sim
 
+## 0.10.4
+
+### Patch Changes
+
+- 0f718a1: Follow the active simulator display when capturing screenshots, or select a device screen by ID. Preserve validated screenshots after failed or concurrent captures, bound native waits, and support the sole screen on tvOS when native selection is unavailable. Keep native diagnostics in host logs. Preserve default screenshots with older iOS Simulator profiles by verifying the sole integrated framebuffer port before capturing it.
+- ace59bf: Follow external Duo rotation in the preview using native physical orientation, without applying UI rotation readback twice, including while a hinge command is pending.
+- 706806e: Make tunneled and dashboard screenshot downloads follow the active Duo panel, with an optional explicit display query. Single-display devices can fall back to simctl when native capture is unavailable.
+
+  Add troubleshooting guidance when CoreDevice cannot find a simulator, including how to check for a stale service after an Xcode update.
+
+- 3dc6128: Report native hinge observations through the CLI and host actions after external folds. Report failed native reads as errors instead of successful partial state.
+
+  Preserve readback from older helpers and immediate acknowledged Tent controls. Report tabletop activity only from native samples, and keep unobserved Table Mode availability unknown.
+
 ## 0.10.3
 
 ### Patch Changes

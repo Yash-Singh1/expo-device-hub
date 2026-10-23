@@ -45,7 +45,7 @@ CLI and existing clients; the additional `observedDeviceState` object is a full
 native snapshot for preview. Once present, omitted fields are unknown and never
 fall back to saved commands. Table Mode eligibility uses physical orientation,
 independently of an app's screen rotation. Before enabling Table Mode or turning
-face-down, a native getter reconciles angle and physical orientation with their latest
+face-down, a native getter reconciles angle, physical orientation and table state with their latest
 successful control sends. A command's value remains eligible until that field has a newer source
 sample, including an unknown sample; unrelated fields and delayed delivery do not
 revoke it. Observation loss and capture reset clear these temporary values. The
@@ -82,12 +82,18 @@ loads Apple's `V68.usdz` from a local Xcode installation, with the live stream
 on its cover or inner display. Folding, unfolding, and
 switching poses animate continuously, including when a new preset interrupts a
 transition. Closed presents the cover straight toward the viewer, and Open
-presents the inner display straight toward the viewer. The view uses native
-orientation once when connecting. Rotate controls and pose presets choose the
-device's orientation. In Closed, Book (Partially open), and Open, hinge edits
+presents the inner display straight toward the viewer. The view initializes from display geometry, then follows native physical
+orientation for external rotations. UI rotation previews immediately and ignores
+stale native readback for up to 1500 ms, so acknowledgement does not turn the
+model twice. A pending hinge command retains that UI turn through the grace
+timer; readback reconciles it after the hinge releases the view. [observed:
+`useDuoFraming`, `createDuoRotationState`]
+If no physical baseline existed when the UI rotated, its first
+native sample establishes absolute camera framing; subsequent turns apply
+immediately. That first sample may briefly correct an optimistic guess. Pose presets choose their own physical camera framing. In Closed, Book (Partially open), and Open, hinge edits
 smoothly turn the cover or inner screens toward the viewer while retaining the
-chosen portrait/landscape orientation. Display switches and delayed orientation
-updates never rotate the model.
+chosen portrait/landscape orientation. Display switches and delayed app orientation
+updates never rotate the model; physical orientation updates do.
 Laptop has a level base and horizontal hinge; Tent presents the outer cover
 screen with both halves descending from a horizontal ridge. In these two tabletop
 modes, slider adjustments preserve the view through the closed and open endpoints.
@@ -157,9 +163,13 @@ The CLI also accepts an angle, such as `serve-sim hinge 120 -d <udid>`. A comman
 waits for an acknowledgement and reports failures instead of assuming that
 writing to the input socket changed the device.
 
-Run `serve-sim hinge` without a position to print the server's confirmed hinge
-state as JSON: angle, pose, physical orientation, Table Mode, and whether Table
-Mode is available. It does not move the device. Unknown fields are left out.
+Run `serve-sim hinge` without a position to read the observed angle, pose, and
+physical orientation as JSON. `tableMode` is the acknowledged setting;
+`tableModeActive` is the observed native sensor activity, which can differ from
+that setting. The response also reports whether Table Mode is available. It
+does not move the device. Unknown fields are left out; a failed native read
+returns an error instead of a successful partial state. [observed:
+`DeviceSession` command `0x13`, `NativeHid.hingeControlEligibility`]
 
 ## Hinge state at startup
 
@@ -187,6 +197,8 @@ pose command that fails.
 
 ## Confirmed hinge state
 
+Acknowledged control updates share one recorder for legacy command fields and timestamped readback overlays. Raw native snapshots remain separate. The native read returns raw tabletop activity alongside the reconciled control fields in one actor turn; `tableModeActive` never uses the acknowledgement overlay. `hingePose` follows reconciled controls so an acknowledged Tent remains readable before the next sample. Legacy helpers without the readback protocol retain config command fields. Readback omits Table Mode availability until angle and orientation are known; unknown does not mean unavailable.
+
 Recording and live preview observe native pose separately from the successful-command cache and
 saved startup state. It opens the hinge stream with requested 100 ms updates and
 a one-degree threshold, plus a generic motion stream for physical orientation
@@ -200,6 +212,12 @@ independent native timestamp watermarks reject history and out-of-order angle,
 motion and orientation-query samples. A failure clears observed fields and
 retries after one second while a recording or live preview remains active. A stationary device's
 Table activity can be unknown until a fresh motion event arrives.
+
+When CoreDevice does not list the device, the observation logs a troubleshooting
+hint once per observation task: check `xcrun devicectl list devices`, then consider
+a stale per-user CoreDeviceService after an Xcode update. Restarting that service
+is a manual step and can interrupt other device sessions; serve-sim does not do it
+automatically [observed: `CoreDeviceBridge.runDeviceStateObservation`].
 
 Apple's native tabletop value zero (`Ambiguous`) records `tableMode: false`;
 recognized values 1–10 record `true`. Missing or unrecognized values are absent.

@@ -161,6 +161,7 @@ actor CaptureEngine {
         self.frameContinuation = frameContinuation
         do {
             await refreshSnapshotSize()
+            guard phase == .starting else { throw CancellationError() }
             let nativeFrameMailbox = self.nativeFrameMailbox
             let generation = captureGeneration
             try await frameCapture.start(deviceUDID: deviceUDID, screenID: screenID) { pixelBuffer, timestamp, canvas, screen in
@@ -185,6 +186,10 @@ actor CaptureEngine {
         }
         webRTCEncodeCanvas = await frameCapture.webRTCEncodeCanvasSize()
             ?? Dimensions(width: 0, height: 0)
+        guard phase == .starting else {
+            frameContinuation.finish()
+            return
+        }
         Task {
             for await frame in frames {
                 await handleFrame(frame)
@@ -450,6 +455,10 @@ actor CaptureEngine {
     func currentScreenSize() async -> CapturedScreenInfo {
         await frameCapture.getScreenSize()
             ?? CapturedScreenInfo(width: screenSize.width, height: screenSize.height)
+    }
+
+    func activeScreenID() async throws -> UInt32 {
+        try await frameCapture.activeScreenID()
     }
 
     func subscribeScreenChanges(_ callback: @escaping @Sendable () -> Void) async -> @Sendable () async -> Void {

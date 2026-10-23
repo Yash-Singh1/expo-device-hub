@@ -113,7 +113,10 @@ private func u32(_ v: Int) -> UInt32 {
     }
 
     @NodeMethod func hingeControlEligibility() async -> [String: any NodePropertyConvertible] {
-        hingeStateProperties(await CoreDeviceBridge.shared.hingeControlEligibility(udid: udid))
+        let readback = await CoreDeviceBridge.shared.hingeControlReadback(udid: udid)
+        var result = hingeStateProperties(readback.state)
+        if let active = readback.tableModeActive { result["tableModeActive"] = active }
+        return result
     }
 
     private func hingeStateProperties(_ state: CoreDeviceBridge.HingeState) -> [String: any NodePropertyConvertible] {
@@ -280,6 +283,10 @@ private func u32(_ v: Int) -> UInt32 {
 
     @NodeMethod func webRTCSenderStats(_ sessionId: String) async throws -> String {
         try await engine.webRTCSenderStats(sessionId: sessionId.isEmpty ? nil : sessionId)
+    }
+
+    @NodeMethod func activeScreenId() async throws -> Int {
+        Int(try await engine.activeScreenID())
     }
 
     @NodeMethod func screenSize() async -> [String: any NodePropertyConvertible] {
