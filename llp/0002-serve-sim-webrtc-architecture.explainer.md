@@ -5,7 +5,7 @@
 **Systems:** ServeSim
 **Author:** Imported from expo/serve-sim in #79 (original authors are in that repo); later edits by Gabe Debes
 **Date:** 2026-09-23
-**Revised:** 2026-10-02 (moved into the LLP corpus from `packages/serve-sim/packages/serve-sim/docs/webrtc-architecture.md`; links and paths updated)
+**Revised:** 2026-10-02 (moved into the LLP corpus from `packages/serve-sim/packages/serve-sim/docs/webrtc-architecture.md`; links and paths updated); 2026-10-23 (drop policy per transport)
 **Related:** LLP 0001
 
 > File paths such as `src/…` are relative to `packages/serve-sim/packages/serve-sim`, unless the text gives a path from the repository root.
@@ -167,6 +167,9 @@ The request stays fixed for that publisher, including session rebuilds, instead
 of depending on whether an early low-latency frame triggers fallback. Root
 feeds and fixed panels with a missing or non-paravirtualized probe keep the
 low-latency request and its existing fallback after creation or encoding failure.
+The shared WebRTC encoder also falls back on its first rate-control drop. HTTP
+AVCC keeps the low-latency session after a drop and falls back only after three
+dropped keyframes in a row.
 Per-peer `maintainResolution` adaptation is unchanged. [observed:
 `Sources/StreamingPolicy/WebRTCH264RateControlPolicy.swift`;
 `Sources/SimNative/WebRTCPublisher.swift`, initializer and `applySenderParameters(to:)`;

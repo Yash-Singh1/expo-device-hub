@@ -102,4 +102,65 @@ final class H264EncoderFallbackTests: XCTestCase {
         XCTAssertEqual(fallbacks, 0)
         await encoder.stop()
     }
+
+    /// A dropped forced keyframe carries to the next frame on the same session.
+    func testDroppedKeyframeCarriesToNextFrame() async throws {
+        try requireLowLatencyRateControl()
+        let encoder = H264Encoder(fps: 60, bitrate: 500_000, simulateDrop: { frame, _, _ in frame == 1 })
+        let flat = try frame()
+        let dropped = try await encoder.encode(flat, forceKeyframe: true)
+        XCTAssertNil(dropped)
+        let nextOutput = try await encoder.encode(flat)
+        let next = try XCTUnwrap(nextOutput)
+        XCTAssertEqual(next.kind, .keyframe)
+        XCTAssertNotNil(next.description)
+        let fallbacks = await encoder.lowLatencyFallbacks
+        let drops = await encoder.droppedFrames
+        await encoder.stop()
+        XCTAssertEqual(fallbacks, 0)
+        XCTAssertEqual(drops, 1)
+    }
+
+    /// Repeated dropped keyframes fall back to a fresh default-rate-control session.
+    func testRepeatedDroppedKeyframesFallBack() async throws {
+        try requireLowLatencyRateControl()
+        let encoder = H264Encoder(fps: 60, bitrate: 500_000,
+                                  simulateDrop: { _, forced, lowLatency in forced && lowLatency })
+        let flat = try frame()
+        let limit = H264Encoder.maxConsecutiveDroppedKeyframes
+        for _ in 1..<limit {
+            let dropped = try await encoder.encode(flat, forceKeyframe: true)
+            XCTAssertNil(dropped)
+        }
+        let recoveredOutput = try await encoder.encode(flat, forceKeyframe: true)
+        let recovered = try XCTUnwrap(recoveredOutput)
+        XCTAssertEqual(recovered.kind, .keyframe)
+        XCTAssertNotNil(recovered.description)
+        let fallbacks = await encoder.lowLatencyFallbacks
+        let drops = await encoder.droppedFrames
+        await encoder.stop()
+        XCTAssertEqual(fallbacks, 1)
+        XCTAssertEqual(drops, UInt64(limit))
+    }
+
+    /// Shared WebRTC keeps its policy: a drop in default mode rebuilds the session.
+    func testWebRTCDefaultModeDropRebuildsSession() async throws {
+        let encoder = H264Encoder(fps: 60, bitrate: 500_000, constrainedBaseline: true,
+                                  dynamicBitrate: true, lowLatencyRateControl: false,
+                                  fallbackOnFrameDrop: true, simulateDrop: { frame, _, _ in frame == 2 })
+        let flat = try frame()
+        let first = try await encoder.encode(flat, forceKeyframe: true)
+        XCTAssertNotNil(first?.description)
+        do {
+            _ = try await encoder.encode(flat)
+            XCTFail("a default-mode WebRTC drop must rebuild the session and throw")
+        } catch {}
+        let rebuiltOutput = try await encoder.encode(flat)
+        let rebuilt = try XCTUnwrap(rebuiltOutput)
+        XCTAssertEqual(rebuilt.kind, .keyframe)
+        XCTAssertNotNil(rebuilt.description, "a rebuilt session emits a new decoder configuration")
+        let drops = await encoder.droppedFrames
+        await encoder.stop()
+        XCTAssertEqual(drops, 1)
+    }
 }

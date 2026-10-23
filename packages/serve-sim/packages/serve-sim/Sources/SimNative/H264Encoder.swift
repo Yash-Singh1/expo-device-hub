@@ -11,6 +11,8 @@ import VideoToolbox
 /// newest pending frame so a slow encoder cannot stall capture or other viewers.
 actor H264Encoder {
     private static let encodeTimeout = DispatchTimeInterval.milliseconds(500)
+    /// Forced keyframes dropped in a row before the encoder falls back to a fresh session.
+    static let maxConsecutiveDroppedKeyframes = 3
 
     let queue = DispatchSerialQueue(label: "h264-encoder", qos: .userInteractive)
     nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
@@ -36,12 +38,17 @@ actor H264Encoder {
     /// Times the encoder fell back from low-latency to default rate control. Nothing turns
     /// low-latency rate control back on, so it is 0 or 1 for one encoder.
     private(set) var lowLatencyFallbacks: UInt64 = 0
+    /// Frames VideoToolbox dropped under rate control (noErr, kVTEncodeInfo_FrameDropped).
+    private(set) var droppedFrames: UInt64 = 0
+    private var consecutiveDroppedKeyframes = 0
     private var forceKeyframeAfterReset = false
     private var encodeInFlight = false
     private var pendingSettings: (fps: Int32, bitrate: Int)?
     private let constrainedBaseline: Bool
     private let dynamicBitrate: Bool
     private let fallbackOnFrameDrop: Bool
+    /// Test hook: report a rate-control drop for (frame, forced keyframe, low-latency) instead of encoding.
+    private let simulateDrop: (@Sendable (Int64, Bool, Bool) -> Bool)?
 
     /// Byte and second pairs for the WebRTC shared encoder (dynamic bitrate): the target over one
     /// second, and 1.5 times it over a tenth of a second. AverageBitRate alone let the first frames
@@ -57,12 +64,14 @@ actor H264Encoder {
 
     init(fps: Int = 60, bitrate: Int = 6_000_000,
          constrainedBaseline: Bool = false, dynamicBitrate: Bool = false,
-         lowLatencyRateControl: Bool = true, fallbackOnFrameDrop: Bool = false) {
+         lowLatencyRateControl: Bool = true, fallbackOnFrameDrop: Bool = false,
+         simulateDrop: (@Sendable (Int64, Bool, Bool) -> Bool)? = nil) {
         self.fps = Int32(max(1, fps))
         self.bitrate = max(1, bitrate)
         self.constrainedBaseline = constrainedBaseline
         self.dynamicBitrate = dynamicBitrate
         self.fallbackOnFrameDrop = fallbackOnFrameDrop
+        self.simulateDrop = simulateDrop
         self.lowLatencyEnabled = lowLatencyRateControl
     }
 
@@ -70,7 +79,11 @@ actor H264Encoder {
         if let session { VTCompressionSessionInvalidate(session) }
     }
 
-    /// Submit one frame. A successful rate-control drop returns nil; encode errors throw.
+    /// Submit one frame and resume when VideoToolbox returns its sample.
+    ///
+    /// Returns nil when VideoToolbox drops the frame under rate control. The session is kept and a
+    /// pending keyframe request carries to the next frame. Throws when no session can be created,
+    /// or when the encode fails or times out and the default-rate-control retry also fails.
     func encode(_ source: CVPixelBuffer, forceKeyframe: Bool = false) async throws -> Encoded? {
         let w = Int32(CVPixelBufferGetWidth(source))
         let h = Int32(CVPixelBufferGetHeight(source))
@@ -106,10 +119,15 @@ actor H264Encoder {
         )
         switch result {
         case let .sample(buffer):
+            consecutiveDroppedKeyframes = 0
             return try extract(from: buffer)
         case .dropped:
-            // A successful rate-control drop does not invalidate the session.
-            if !lowLatencyEnabled || !fallbackOnFrameDrop {
+            noteDrop()
+            if fallbackOnFrameDrop { break }
+            // A successful rate-control drop does not invalidate the session, but a run of dropped
+            // keyframes would leave a new viewer without a decoder configuration.
+            if effectiveForceKeyframe { consecutiveDroppedKeyframes += 1 }
+            if consecutiveDroppedKeyframes < Self.maxConsecutiveDroppedKeyframes {
                 forceKeyframeAfterReset = effectiveForceKeyframe
                 return nil
             }
@@ -122,9 +140,12 @@ actor H264Encoder {
             rebuildSession()
             throw Errors.encodingFailed
         }
-        // Errors and timeouts retain the existing fallback. Shared WebRTC also
-        // opts into fallback on drops to preserve its measured EAS motion throughput.
-        streamDiagnosticLog("[stream:h264] low-latency produced no frame; retrying with default rate control")
+        // VideoToolbox drops the second frame of most low-latency sessions (noErr, no sample,
+        // kVTEncodeInfo_FrameDropped). The shared WebRTC encoder falls back on that drop: on EAS,
+        // staying on low-latency rate control dropped about 12 frames a second in full-screen
+        // motion (#191). HTTP AVCC keeps the session after a drop and falls back here only on
+        // errors, timeouts, and repeated dropped keyframes.
+        streamDiagnosticLog("[stream:h264] low-latency encode failed; retrying with default rate control")
         lowLatencyEnabled = false
         lowLatencyFallbacks &+= 1
         forceKeyframeAfterReset = true
@@ -146,10 +167,16 @@ actor H264Encoder {
             forceKeyframeAfterReset = false
             return try extract(from: buffer)
         case .dropped:
+            noteDrop()
             return nil
         case .failed:
             throw Errors.encodingFailed
         }
+    }
+
+    private func noteDrop() {
+        droppedFrames &+= 1
+        streamDiagnosticLog("[stream:h264] rate control dropped frame \(frameCount) (total \(droppedFrames))")
     }
 
     private func encodeFrame(
@@ -158,7 +185,11 @@ actor H264Encoder {
         presentationTimeStamp: CMTime,
         frameProperties: NSDictionary?
     ) async -> EncodeResult {
-        await withCheckedContinuation { continuation in
+        if let simulateDrop,
+           simulateDrop(presentationTimeStamp.value, frameProperties != nil, lowLatencyEnabled) {
+            return .dropped
+        }
+        return await withCheckedContinuation { continuation in
             let completion = EncodeCompletion(continuation)
             let timeout = DispatchWorkItem {
                 streamDiagnosticLog("[stream:h264] encode timed out")
@@ -244,7 +275,11 @@ actor H264Encoder {
         // Request VideoToolbox's low-latency rate-control pipeline. Both modes
         // also request real-time encoding and disable frame reordering below.
         // Decoder reference-buffer capacity alone does not establish display
-        // latency. Fall back if session creation or an encode fails.
+        // latency. Fall back if session creation or an encode fails. Drop policy
+        // differs by transport: shared WebRTC also falls back on its first
+        // rate-control drop, while HTTP AVCC keeps the session unless
+        // `maxConsecutiveDroppedKeyframes` forced keyframes drop in a row.
+        consecutiveDroppedKeyframes = 0
         let lowLatencySpec: NSDictionary = [
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue!,
         ]
