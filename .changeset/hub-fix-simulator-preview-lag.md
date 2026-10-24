@@ -2,4 +2,4 @@
 "expo-device-hub": patch
 ---
 
-Prevent roughly three seconds of iOS Simulator preview lag in the Hub by keeping serve-sim's low-latency encoding enabled after successful frame drops.
+Fix about three seconds of lag in the iOS Simulator preview on Chromium. The vendored serve-sim stream now declares that frames are never reordered after its encoder falls back to default rate control.

@@ -776,7 +776,7 @@ actor AVCCEncoder: FrameEncoder {
             pixelBuffer,
             forceKeyframe: forceKeyframe,
         )
-        if result != nil { forceKeyframe = false }
+        forceKeyframe = false
         return result
     }
 

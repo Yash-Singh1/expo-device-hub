@@ -2,4 +2,4 @@
 "@expo/serve-sim": patch
 ---
 
-Prevent roughly three seconds of HTTP simulator preview lag by keeping low-latency encoding enabled after successful frame drops.
+Fix about three seconds of lag in the HTTP simulator preview on Chromium. When the encoder falls back to default rate control, the stream now declares that frames are never reordered.
